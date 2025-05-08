@@ -4,7 +4,6 @@
 // GNU General Public License version 2.
 mod bpf_skel;
 mod stats;
-
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -18,6 +17,19 @@ use std::sync::Arc;
 use std::thread::ThreadId;
 use std::time::Duration;
 use std::time::Instant;
+use std::{
+    io::{Error, ErrorKind},
+    os::{
+        fd::AsFd,
+        unix::{
+            io::{AsRawFd, RawFd},
+            net::UnixListener,
+        },
+    },
+    path::Path,
+    sync::mpsc,
+    thread,
+};
 
 use ::fb_procfs as procfs;
 use anyhow::anyhow;
@@ -634,6 +646,10 @@ struct Opts {
     /// Set the path for pinning the task hint map.
     #[clap(long, default_value = "")]
     task_hint_map: String,
+
+    /// Set the path for pinning the task hint UDS.
+    #[clap(long, default_value = "")]
+    task_hint_uds: String,
 }
 
 fn read_total_cpu(reader: &procfs::ProcReader) -> Result<procfs::CpuStat> {
@@ -1209,6 +1225,8 @@ struct Scheduler<'a> {
     topo: Arc<Topology>,
     netdevs: BTreeMap<String, NetDev>,
     stats_server: StatsServer<StatsReq, StatsRes>,
+
+    hint_map_thread: Option<(mpsc::Sender<()>, thread::JoinHandle<std::io::Result<()>>)>,
 }
 
 impl<'a> Scheduler<'a> {
@@ -1728,6 +1746,104 @@ impl<'a> Scheduler<'a> {
         Ok(())
     }
 
+    pub fn spawn_map_fd_publisher<P: AsRef<Path>>(
+        sock_path: P,
+        fd_to_send: RawFd,
+    ) -> std::io::Result<(mpsc::Sender<()>, thread::JoinHandle<std::io::Result<()>>)> {
+        let path = sock_path.as_ref().to_owned();
+        let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
+
+        let handle = thread::spawn(move || {
+            // Remove stale node (ignore errors).
+            let _ = fs::remove_file(&path);
+
+            let listener = UnixListener::bind(&path)?;
+
+            unsafe {
+                let mode: libc::mode_t = 0o666;
+                if libc::chmod(
+                    CString::new(path.as_os_str().as_encoded_bytes())
+                        .unwrap()
+                        .as_ptr(),
+                    mode,
+                ) != 0
+                {
+                    trace!("'chmod' to 666 of task hint map failed, continuing...");
+                }
+            }
+
+            unsafe extern "C" fn noop_handler(_: i32) {}
+
+            unsafe {
+                libc::signal(libc::SIGUSR1, noop_handler as usize);
+            }
+
+            loop {
+                // 1. honour a shutdown signal
+                if shutdown_rx.try_recv().is_ok() {
+                    break;
+                }
+
+                // 2. accept connections if any
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        unsafe {
+                            use libc::{
+                                c_void, cmsghdr, iovec, msghdr, sendmsg, CMSG_DATA, CMSG_FIRSTHDR,
+                                CMSG_LEN, CMSG_SPACE, SCM_RIGHTS, SOL_SOCKET,
+                            };
+
+                            // one-byte payload (required)
+                            let dummy: [u8; 1] = [0];
+                            let mut iov = iovec {
+                                iov_base: dummy.as_ptr() as *mut c_void,
+                                iov_len: dummy.len(),
+                            };
+
+                            // ctrl buffer
+                            let mut ctrl =
+                                [0u8; unsafe { CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) }
+                                    as usize];
+
+                            let mut msg: msghdr = std::mem::zeroed();
+                            msg.msg_iov = &mut iov;
+                            msg.msg_iovlen = 1;
+                            msg.msg_control = ctrl.as_mut_ptr() as *mut c_void;
+                            msg.msg_controllen = ctrl.len();
+
+                            let cmsg: *mut cmsghdr = CMSG_FIRSTHDR(&msg);
+                            if cmsg.is_null() {
+                                return Err(Error::new(ErrorKind::Other, "CMSG_FIRSTHDR null"));
+                            }
+                            (*cmsg).cmsg_level = SOL_SOCKET;
+                            (*cmsg).cmsg_type = SCM_RIGHTS;
+                            (*cmsg).cmsg_len =
+                                CMSG_LEN(std::mem::size_of::<RawFd>() as u32) as usize;
+
+                            *(CMSG_DATA(cmsg) as *mut RawFd) = fd_to_send;
+
+                            if sendmsg(stream.as_raw_fd(), &msg, 0) == -1 {
+                                return Err(Error::last_os_error());
+                            }
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                        // accept() was interrupted by signal
+                        break;
+                    }
+                    // fatal error – bail
+                    Err(e) => return Err(e),
+                }
+            }
+
+            // tear-down
+            let _ = fs::remove_file(&path);
+            Ok(())
+        });
+
+        Ok((shutdown_tx, handle))
+    }
+
     fn init(
         opts: &'a Opts,
         layer_specs: &[LayerSpec],
@@ -1928,9 +2044,9 @@ impl<'a> Scheduler<'a> {
         // so that we can keep reusing the older map already pinned on scheduler
         // restarts.
         let layered_task_hint_map_path = &opts.task_hint_map;
-        let hint_map = &mut skel.maps.scx_layered_task_hint_map;
         // Only set pin path if a path is provided.
         if layered_task_hint_map_path.is_empty() == false {
+            let hint_map = &mut skel.maps.scx_layered_task_hint_map;
             hint_map.set_pin_path(layered_task_hint_map_path).unwrap();
         }
 
@@ -1974,6 +2090,7 @@ impl<'a> Scheduler<'a> {
         // attach, but the value will quickly converge anyways so it's not a
         // huge problem in the interim until we figure it out.
 
+        let mut hint_map_thread = None;
         // Allow all tasks to open and write to BPF task hint map, now that
         // we should have it pinned at the desired location.
         if layered_task_hint_map_path.is_empty() == false {
@@ -1983,6 +2100,15 @@ impl<'a> Scheduler<'a> {
                 if libc::chmod(path.as_ptr(), mode) != 0 {
                     trace!("'chmod' to 666 of task hint map failed, continuing...");
                 }
+            }
+
+            let hint_map = &skel.maps.scx_layered_task_hint_map;
+            if opts.task_hint_uds.is_empty() == false {
+                let res = Self::spawn_map_fd_publisher(
+                    &opts.task_hint_uds,
+                    hint_map.as_fd().as_raw_fd(),
+                )?;
+                hint_map_thread = Some(res);
             }
         }
 
@@ -2012,6 +2138,8 @@ impl<'a> Scheduler<'a> {
             topo,
             netdevs,
             stats_server,
+
+            hint_map_thread,
         };
 
         info!("Layered Scheduler Attached. Run `scx_layered --monitor` for metrics.");
@@ -2673,6 +2801,14 @@ impl<'a> Scheduler<'a> {
 
 impl Drop for Scheduler<'_> {
     fn drop(&mut self) {
+        let hint_map_thread = std::mem::take(&mut self.hint_map_thread);
+        if let Some((shutdown_tx, handle)) = hint_map_thread {
+            unsafe {
+                use std::os::unix::thread::JoinHandleExt;
+                libc::pthread_kill(handle.as_pthread_t(), libc::SIGUSR1);
+            }
+            shutdown_tx.send(()).unwrap();
+        }
         if let Some(struct_ops) = self.struct_ops.take() {
             drop(struct_ops);
         }
