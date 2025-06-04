@@ -1339,9 +1339,11 @@ static void layer_kick_idle_cpu(struct layer *layer)
 	    !(idle_smtmask = scx_bpf_get_idle_smtmask()))
 		return;
 
+	if (!bpf_cpumask_intersects(layer_cpumask, idle_smtmask))
+		goto out;
 	if ((cpu = pick_idle_cpu_from(layer_cpumask, 0, idle_smtmask, layer)) >= 0)
 		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
-
+out:
 	scx_bpf_put_idle_cpumask(idle_smtmask);
 }
 
