@@ -2705,6 +2705,20 @@ void BPF_STRUCT_OPS(layered_running, struct task_struct *p)
 	}
 }
 
+u64 remap_hint(u64 hint)
+{
+	// HACK(kkd)
+	//return hint;
+	if (hint == 384) // processing
+		return 1;
+	if (hint == 640) // post-processing
+		return 512;
+	if (hint == 768) // idle
+		return 512;
+
+	return hint;
+}
+
 void BPF_STRUCT_OPS(layered_stopping, struct task_struct *p, bool runnable)
 {
 	struct cpu_ctx *cpuc;
@@ -2787,12 +2801,13 @@ void BPF_STRUCT_OPS(layered_stopping, struct task_struct *p, bool runnable)
 
 	runtime = runtime * 100 / p->scx.weight;
 
+	u64 hint = 512;
 	task_hint = bpf_task_storage_get(&scx_layered_task_hint_map, p, NULL, 0);
 	if (task_hint) {
-		u64 hint = task_hint->hint ?: 1;
-		hint = hint < 1024 ? hint : 1024;
-		runtime = (runtime * hint) / 1024;
+		hint = remap_hint(task_hint->hint) ?: 1;
 	}
+	hint = hint < 1024 ? hint : 1024;
+	runtime = (runtime * hint) / 1024;
 
 	p->scx.dsq_vtime += runtime;
 }
