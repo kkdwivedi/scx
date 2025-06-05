@@ -1402,6 +1402,7 @@ void BPF_STRUCT_OPS(layered_enqueue, struct task_struct *p, u64 enq_flags)
 	    try_preempt_cpu(task_cpu, p, taskc, layer, PREEMPT_FIRST))
 		return;
 
+	struct task_hint *task_hint = bpf_task_storage_get(&scx_layered_task_hint_map, p, NULL, 0);
 	/*
 	 * If select_cpu() was skipped, try direct dispatching to an idle CPU.
 	 */
@@ -1542,7 +1543,7 @@ void BPF_STRUCT_OPS(layered_enqueue, struct task_struct *p, u64 enq_flags)
 	 * without making the whole scheduler node aware and should only be used
 	 * with open layers on non-saturated machines to avoid possible stalls.
 	 */
-	if ((!taskc->all_cpuset_allowed &&
+	if ((task_hint && task_hint->hint == 640) || (!taskc->all_cpuset_allowed &&
 	     !(layer->allow_node_aligned && taskc->cpus_node_aligned)) ||
 	    !layer->nr_cpus) {
 		taskc->dsq_id = task_cpuc->lo_fb_dsq_id;
@@ -1585,11 +1586,11 @@ void BPF_STRUCT_OPS(layered_enqueue, struct task_struct *p, u64 enq_flags)
 	lstats[LLC_LSTAT_CNT]++;
 
 	taskc->dsq_id = layer_dsq_id(layer_id, llc_id);
+
 	if (layer->fifo)
 		scx_bpf_dsq_insert(p, taskc->dsq_id, layer->slice_ns, enq_flags);
 	else
 		scx_bpf_dsq_insert_vtime(p, taskc->dsq_id, layer->slice_ns, vtime, enq_flags);
-
 	/*
 	 * Interlocked with refresh_cpumasks(). scx_bpf_dsq_insert[_vtime]()
 	 * always goes through spin lock/unlock and has enough barriers to
@@ -1668,6 +1669,10 @@ static bool keep_running(struct cpu_ctx *cpuc, struct task_struct *p,
 
 	/* if hi_fb has tasks pending, don't keep running the current one */
 	if (scx_bpf_dsq_nr_queued(cpuc->hi_fb_dsq_id))
+		goto no;
+
+	/* if lo_fb has tasks pending, don't keep running the current one */
+	if (scx_bpf_dsq_nr_queued(cpuc->lo_fb_dsq_id))
 		goto no;
 
 	/* @p has fully consumed its slice and still wants to run */
@@ -2724,7 +2729,6 @@ void BPF_STRUCT_OPS(layered_stopping, struct task_struct *p, bool runnable)
 	struct cpu_ctx *cpuc;
 	struct task_ctx *taskc;
 	struct layer *task_layer;
-	struct task_hint *task_hint;
 	u64 now = scx_bpf_now();
 	u64 usage_since_idle;
 	s32 task_lid;
@@ -2800,7 +2804,8 @@ void BPF_STRUCT_OPS(layered_stopping, struct task_struct *p, bool runnable)
 		runtime = task_layer->slice_ns;
 
 	runtime = runtime * 100 / p->scx.weight;
-
+/*
+	struct task_hint *task_hint;
 	u64 hint = 512;
 	task_hint = bpf_task_storage_get(&scx_layered_task_hint_map, p, NULL, 0);
 	if (task_hint) {
@@ -2808,6 +2813,7 @@ void BPF_STRUCT_OPS(layered_stopping, struct task_struct *p, bool runnable)
 	}
 	hint = hint < 1024 ? hint : 1024;
 	runtime = (runtime * hint) / 1024;
+*/
 
 	p->scx.dsq_vtime += runtime;
 }
