@@ -1196,7 +1196,8 @@ s32 BPF_STRUCT_OPS(layered_select_cpu, struct task_struct *p, s32 prev_cpu, u64 
 	if (taskc->layer_id == MAX_LAYERS || !(layer = lookup_layer(taskc->layer_id)))
 		return prev_cpu;
 
-	if (layer->task_place == PLACEMENT_STICK)
+	struct task_hint *task_hint = bpf_task_storage_get(&scx_layered_task_hint_map, p, NULL, 0);
+	if (layer->task_place == PLACEMENT_STICK && (task_hint && task_hint->hint == 640))
 		cpu = prev_cpu;
 	else
 		cpu = pick_idle_cpu(p, prev_cpu, cpuc, taskc, layer, true);
@@ -1407,7 +1408,11 @@ void BPF_STRUCT_OPS(layered_enqueue, struct task_struct *p, u64 enq_flags)
 	 * If select_cpu() was skipped, try direct dispatching to an idle CPU.
 	 */
 	if (!__COMPAT_is_enq_cpu_selected(enq_flags) || try_preempt_first) {
-		cpu = pick_idle_cpu(p, task_cpu, cpuc, taskc, layer, false);
+		// KKD: Low priority tasks do not get to take idle CPUs.
+		if (task_hint && task_hint->hint == 640)
+			cpu = -1;
+		else
+			cpu = pick_idle_cpu(p, task_cpu, cpuc, taskc, layer, false);
 		if (cpu >= 0) {
 			lstat_inc(LSTAT_ENQ_LOCAL, layer, cpuc);
 			taskc->dsq_id = SCX_DSQ_LOCAL_ON | cpu;
