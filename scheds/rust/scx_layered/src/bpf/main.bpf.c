@@ -1584,11 +1584,12 @@ void BPF_STRUCT_OPS(layered_enqueue, struct task_struct *p, u64 enq_flags)
 		LAYER_LAT_DECAY_FACTOR;
 	lstats[LLC_LSTAT_CNT]++;
 
+	struct task_hint *task_hint = bpf_task_storage_get(&scx_layered_task_hint_map, p, NULL, 0);
 	taskc->dsq_id = layer_dsq_id(layer_id, llc_id);
 	if (layer->fifo)
 		scx_bpf_dsq_insert(p, taskc->dsq_id, layer->slice_ns, enq_flags);
 	else
-		scx_bpf_dsq_insert_vtime(p, taskc->dsq_id, layer->slice_ns, vtime, enq_flags);
+		scx_bpf_dsq_insert_vtime(p, taskc->dsq_id, layer->slice_ns, task_hint ? task_hint->hint : vtime, enq_flags);
 
 	/*
 	 * Interlocked with refresh_cpumasks(). scx_bpf_dsq_insert[_vtime]()
