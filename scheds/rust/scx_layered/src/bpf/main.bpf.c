@@ -2069,7 +2069,6 @@ void BPF_STRUCT_OPS(layered_dispatch, s32 cpu, struct task_struct *prev)
 		 * hopefully avoiding thundering herd.
 		 */
 		if (cpuc->lo_fb_seq != llcc->lo_fb_seq) {
-			cpuc->lo_fb_seq_at = now;
 			cpuc->lo_fb_usage_base = cpuc->gstats[GSTAT_LO_FB_USAGE];
 			cpuc->lo_fb_seq = llcc->lo_fb_seq;
 		}
@@ -2082,8 +2081,10 @@ void BPF_STRUCT_OPS(layered_dispatch, s32 cpu, struct task_struct *prev)
 		dur = now - cpuc->lo_fb_seq_at;
 		usage = cpuc->gstats[GSTAT_LO_FB_USAGE] + lo_fb_wait_ns -
 			cpuc->lo_fb_usage_base;
+		(void)usage;
 
-		if (dur > lo_fb_wait_ns && 1024 * usage < lo_fb_share_ppk * dur) {
+		if (dur > 200 * NSEC_PER_SEC) {
+			cpuc->lo_fb_seq_at = now;
 			if (scx_bpf_dsq_move_to_local(cpuc->lo_fb_dsq_id))
 				return;
 			tried_lo_fb = true;
@@ -2164,7 +2165,7 @@ void BPF_STRUCT_OPS(layered_dispatch, s32 cpu, struct task_struct *prev)
 			return;
 	}
 
-	if (!tried_lo_fb && scx_bpf_dsq_move_to_local(cpuc->lo_fb_dsq_id))
+	if (scx_bpf_dsq_move_to_local(cpuc->lo_fb_dsq_id))
 		return;
 
 	/* !NULL prev_taskc indicates runnable prev */
