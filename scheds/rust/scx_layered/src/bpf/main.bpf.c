@@ -1662,12 +1662,6 @@ static void account_used(struct cpu_ctx *cpuc, struct task_ctx *taskc, u64 now)
 static bool keep_running(struct cpu_ctx *cpuc, struct task_struct *p,
 			 struct task_ctx *taskc, struct layer *layer)
 {
-	struct task_hint *task_hint = bpf_task_storage_get(&scx_layered_task_hint_map, p, NULL, 0);
-	u32 hint = task_hint ? task_hint->hint : -1;
-
-	if (hint == 640)
-		goto no;
-
 	if (cpuc->yielding || !max_exec_ns)
 		goto no;
 
@@ -2186,8 +2180,6 @@ void BPF_STRUCT_OPS(layered_dispatch, s32 cpu, struct task_struct *prev)
 
 void BPF_STRUCT_OPS(layered_tick, struct task_struct *p)
 {
-	struct task_hint *task_hint = bpf_task_storage_get(&scx_layered_task_hint_map, p, NULL, 0);
-	u32 hint = task_hint ? task_hint->hint : -1;
 	struct cpu_ctx *cpuc;
 	struct task_ctx *taskc;
 
@@ -2195,10 +2187,6 @@ void BPF_STRUCT_OPS(layered_tick, struct task_struct *p)
 		return;
 
 	account_used(cpuc, taskc, scx_bpf_now());
-
-	if (hint == 640) {
-		p->scx.slice = 0;
-	}
 }
 
 static __noinline bool match_one(struct layer_match *match,
