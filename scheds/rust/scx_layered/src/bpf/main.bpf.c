@@ -1036,6 +1036,8 @@ s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu,
 		if (layer->kind == LAYER_KIND_CONFINED) {
 			has_idle = bpf_cpumask_intersects(layered_cpumask, cpumask);
 		} else {
+			scx_bpf_put_idle_cpumask(cpumask);
+			goto find;
 			maybe_refresh_layered_cpus_unprotected(p, taskc, layered_cpumask);
 			/*
 			 * Use the task's idle unprotected mask if available, otherwise
@@ -1058,7 +1060,7 @@ s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu,
 		if (!has_idle)
 			return -1;
 	}
-
+find:
 	if ((nr_llcs > 1 || nr_nodes > 1) &&
 	    !(prev_cpuc = lookup_cpu_ctx(prev_cpu)))
 		return -1;
