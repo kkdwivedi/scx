@@ -1356,6 +1356,8 @@ out:
 
 void BPF_STRUCT_OPS(layered_enqueue, struct task_struct *p, u64 enq_flags)
 {
+	struct task_hint *task_hint = bpf_task_storage_get(&scx_layered_task_hint_map, p, NULL, 0);
+	u32 hint = task_hint ? task_hint->hint : -1;
 	struct cpu_ctx *cpuc, *task_cpuc;
 	struct task_ctx *taskc;
 	struct llc_ctx *llcc;
@@ -1542,7 +1544,7 @@ void BPF_STRUCT_OPS(layered_enqueue, struct task_struct *p, u64 enq_flags)
 	 * without making the whole scheduler node aware and should only be used
 	 * with open layers on non-saturated machines to avoid possible stalls.
 	 */
-	if ((!taskc->all_cpuset_allowed &&
+	if ((hint == 640) || (!taskc->all_cpuset_allowed &&
 	     !(layer->allow_node_aligned && taskc->cpus_node_aligned)) ||
 	    !layer->nr_cpus) {
 		taskc->dsq_id = task_cpuc->lo_fb_dsq_id;
