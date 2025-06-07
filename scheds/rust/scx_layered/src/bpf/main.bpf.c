@@ -1349,6 +1349,7 @@ static void layer_kick_idle_cpu(struct layer *layer)
 
 void BPF_STRUCT_OPS(layered_enqueue, struct task_struct *p, u64 enq_flags)
 {
+	struct task_hint *task_hint = bpf_task_storage_get(&scx_layered_task_hint_map, p, NULL, 0);
 	struct cpu_ctx *cpuc, *task_cpuc;
 	struct task_ctx *taskc;
 	struct llc_ctx *llcc;
@@ -1581,7 +1582,7 @@ void BPF_STRUCT_OPS(layered_enqueue, struct task_struct *p, u64 enq_flags)
 	if (layer->fifo)
 		scx_bpf_dsq_insert(p, taskc->dsq_id, layer->slice_ns, enq_flags);
 	else
-		scx_bpf_dsq_insert_vtime(p, taskc->dsq_id, layer->slice_ns, vtime, enq_flags);
+		scx_bpf_dsq_insert_vtime(p, taskc->dsq_id, layer->slice_ns, task_hint ? task_hint->hint : vtime, enq_flags);
 
 	/*
 	 * Interlocked with refresh_cpumasks(). scx_bpf_dsq_insert[_vtime]()
