@@ -1198,6 +1198,21 @@ s32 BPF_STRUCT_OPS(layered_select_cpu, struct task_struct *p, s32 prev_cpu, u64 
 	if (taskc->layer_id == MAX_LAYERS || !(layer = lookup_layer(taskc->layer_id)))
 		return prev_cpu;
 
+	struct task_hint *task_hint = bpf_task_storage_get(&scx_layered_task_hint_map, p, NULL, 0);
+	if (task_hint) {
+		switch (task_hint->hint) {
+			case 384:
+				lstat_inc(LSTAT_PREEMPT, layer, cpuc);
+				break;
+			case 640:
+				lstat_inc(LSTAT_PREEMPT_FIRST, layer, cpuc);
+				break;
+			case 768:
+				lstat_inc(LSTAT_PREEMPT_XLLC, layer, cpuc);
+				break;
+		}
+	}
+
 	if (layer->task_place == PLACEMENT_STICK)
 		cpu = prev_cpu;
 	else
@@ -1400,6 +1415,20 @@ void BPF_STRUCT_OPS(layered_enqueue, struct task_struct *p, u64 enq_flags)
 	 * If select_cpu() was skipped, try direct dispatching to an idle CPU.
 	 */
 	if (!__COMPAT_is_enq_cpu_selected(enq_flags) || try_preempt_first) {
+		struct task_hint *task_hint = bpf_task_storage_get(&scx_layered_task_hint_map, p, NULL, 0);
+		if (task_hint) {
+			switch (task_hint->hint) {
+				case 384:
+					lstat_inc(LSTAT_PREEMPT, layer, cpuc);
+					break;
+				case 640:
+					lstat_inc(LSTAT_PREEMPT_FIRST, layer, cpuc);
+					break;
+				case 768:
+					lstat_inc(LSTAT_PREEMPT_XLLC, layer, cpuc);
+					break;
+			}
+		}
 		cpu = pick_idle_cpu(p, task_cpu, cpuc, taskc, layer, false);
 		if (cpu >= 0) {
 			lstat_inc(LSTAT_ENQ_LOCAL, layer, cpuc);
@@ -1583,6 +1612,20 @@ void BPF_STRUCT_OPS(layered_enqueue, struct task_struct *p, u64 enq_flags)
 		scx_bpf_dsq_insert(p, taskc->dsq_id, layer->slice_ns, enq_flags);
 	else
 		scx_bpf_dsq_insert_vtime(p, taskc->dsq_id, layer->slice_ns, task_hint ? task_hint->hint : vtime, enq_flags);
+	if (task_hint && task_hint->hint) {
+		lstat_inc(LSTAT_SKIP_REMOTE_NODE, layer, cpuc);
+		switch (task_hint->hint) {
+			case 384:
+				lstat_inc(LSTAT_PREEMPT_XNUMA, layer, cpuc);
+				break;
+			case 640:
+				lstat_inc(LSTAT_PREEMPT_IDLE, layer, cpuc);
+				break;
+			case 768:
+				lstat_inc(LSTAT_PREEMPT_FAIL, layer, cpuc);
+				break;
+		}
+	}
 
 	/*
 	 * Interlocked with refresh_cpumasks(). scx_bpf_dsq_insert[_vtime]()
