@@ -1180,6 +1180,8 @@ bool maybe_update_task_llc(struct task_struct *p, struct task_ctx *taskc, s32 ne
 
 s32 BPF_STRUCT_OPS(layered_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
+	struct task_hint *task_hint = bpf_task_storage_get(&scx_layered_task_hint_map, p, NULL, 0);
+	u32 hint = task_hint ? task_hint->hint : -1;
 	struct cpu_ctx *cpuc;
 	struct task_ctx *taskc;
 	struct layer *layer;
@@ -1193,7 +1195,7 @@ s32 BPF_STRUCT_OPS(layered_select_cpu, struct task_struct *p, s32 prev_cpu, u64 
 	 * As layered_select_cpu() takes place before runnable, new tasks would
 	 * still have MAX_LAYERS layer. Just return @prev_cpu.
 	 */
-	if (taskc->layer_id == MAX_LAYERS || !(layer = lookup_layer(taskc->layer_id)))
+	if (taskc->layer_id == MAX_LAYERS || !(layer = lookup_layer(taskc->layer_id)) || hint == 640)
 		return prev_cpu;
 
 	if (layer->task_place == PLACEMENT_STICK)
@@ -1408,7 +1410,10 @@ void BPF_STRUCT_OPS(layered_enqueue, struct task_struct *p, u64 enq_flags)
 	 * If select_cpu() was skipped, try direct dispatching to an idle CPU.
 	 */
 	if (!__COMPAT_is_enq_cpu_selected(enq_flags) || try_preempt_first) {
-		cpu = pick_idle_cpu(p, task_cpu, cpuc, taskc, layer, false);
+		if (hint == 640)
+			cpu = -1;
+		else
+			cpu = pick_idle_cpu(p, task_cpu, cpuc, taskc, layer, false);
 		if (cpu >= 0) {
 			lstat_inc(LSTAT_ENQ_LOCAL, layer, cpuc);
 			taskc->dsq_id = SCX_DSQ_LOCAL_ON | cpu;
