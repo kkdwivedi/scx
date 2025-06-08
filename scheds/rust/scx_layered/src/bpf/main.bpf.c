@@ -574,7 +574,6 @@ struct task_ctx {
 	u64			runtime_avg;
 	u64			dsq_id;
 	u32			llc_id;
-	u64			flush0_time;
 
 	/* for llcc->queue_runtime */
 	u32			qrt_layer_id;
@@ -1200,13 +1199,13 @@ s32 BPF_STRUCT_OPS(layered_select_cpu, struct task_struct *p, s32 prev_cpu, u64 
 	struct task_hint *task_hint = bpf_task_storage_get(&scx_layered_task_hint_map, p, NULL, 0);
 	if (task_hint) {
 		switch (task_hint->hint) {
-			case 1:
+			case 384:
 				lstat_inc(LSTAT_PREEMPT, layer, cpuc);
 				break;
-			case 384:
+			case 640:
 				lstat_inc(LSTAT_PREEMPT_FIRST, layer, cpuc);
 				break;
-			case 640:
+			case 768:
 				lstat_inc(LSTAT_PREEMPT_XLLC, layer, cpuc);
 				break;
 		}
@@ -1426,13 +1425,13 @@ void BPF_STRUCT_OPS(layered_enqueue, struct task_struct *p, u64 enq_flags)
 		struct task_hint *task_hint = bpf_task_storage_get(&scx_layered_task_hint_map, p, NULL, 0);
 		if (task_hint) {
 			switch (task_hint->hint) {
-				case 1:
+				case 384:
 					lstat_inc(LSTAT_PREEMPT, layer, cpuc);
 					break;
-				case 384:
+				case 640:
 					lstat_inc(LSTAT_PREEMPT_FIRST, layer, cpuc);
 					break;
-				case 640:
+				case 768:
 					lstat_inc(LSTAT_PREEMPT_XLLC, layer, cpuc);
 					break;
 			}
@@ -1618,27 +1617,22 @@ void BPF_STRUCT_OPS(layered_enqueue, struct task_struct *p, u64 enq_flags)
 	taskc->dsq_id = layer_dsq_id(layer_id, llc_id);
 	if (layer->fifo)
 		scx_bpf_dsq_insert(p, taskc->dsq_id, layer->slice_ns, enq_flags);
-	else {
-		u64 deadline = task_hint ? task_hint->hint + 2 * NSEC_PER_SEC : vtime;
-		if (task_hint && task_hint->hint == 1) {
-			deadline = NSEC_PER_SEC - taskc->flush0_time;
-		}
-		scx_bpf_dsq_insert_vtime(p, taskc->dsq_id, layer->slice_ns, deadline, enq_flags);
-	}
-	if (task_hint) {
+	else
+		scx_bpf_dsq_insert_vtime(p, taskc->dsq_id, layer->slice_ns, task_hint ? task_hint->hint : vtime, enq_flags);
+	if (task_hint && task_hint->hint) {
+		lstat_inc(LSTAT_SKIP_REMOTE_NODE, layer, cpuc);
 		switch (task_hint->hint) {
-			case 1:
+			case 384:
 				lstat_inc(LSTAT_PREEMPT_XNUMA, layer, cpuc);
 				break;
-			case 384:
+			case 640:
 				lstat_inc(LSTAT_PREEMPT_IDLE, layer, cpuc);
 				break;
-			case 640:
+			case 768:
 				lstat_inc(LSTAT_PREEMPT_FAIL, layer, cpuc);
 				break;
 		}
 	}
-	lstat_inc(LSTAT_SKIP_REMOTE_NODE, layer, cpuc);
 
 	/*
 	 * Interlocked with refresh_cpumasks(). scx_bpf_dsq_insert[_vtime]()
@@ -2222,7 +2216,6 @@ void BPF_STRUCT_OPS(layered_dispatch, s32 cpu, struct task_struct *prev)
 
 void BPF_STRUCT_OPS(layered_tick, struct task_struct *p)
 {
-	struct task_hint *task_hint = bpf_task_storage_get(&scx_layered_task_hint_map, p, NULL, 0);
 	struct cpu_ctx *cpuc;
 	struct task_ctx *taskc;
 
@@ -2230,45 +2223,6 @@ void BPF_STRUCT_OPS(layered_tick, struct task_struct *p)
 		return;
 
 	account_used(cpuc, taskc, scx_bpf_now());
-
-	if (!task_hint)
-		return;
-	bool non_psp = task_hint->hint == 384;
-	bool psp = task_hint->hint == 640;
-	bool idle = task_hint->hint == 768;
-
-	if (idle || psp) {
-		taskc->flush0_time = 0;
-		return;
-	}
-	// KKD: Assumption is that we pass throughle idle once between psp and
-	// flush0 to reset this and not get thrown off by non-psp and non-zero
-	// flush time for an actual flush0 request.
-	if (non_psp && taskc->flush0_time)
-		return;
-	// We may tick() after a idle->non_psp transition, initialize the flush0
-	// time now. We may also reach stopping without ticking here with flush0
-	// as zero, we can fill it in there and adjust priority.
-	//
-	// We also have to do pretty much this logic (accumulation, and the
-	// deboost (not boost), but for simplicity just invoke the same block
-	// for flush0 threads tick).
-	//
-	// Acculumate time spent in flush0 stage.
-	if (!taskc->flush0_time)
-		taskc->flush0_time = scx_bpf_now() - taskc->running_at;
-	else
-		taskc->flush0_time += NSEC_PER_MSEC;
-	// Deschedule us to give way to other flush0 threads.
-	// Boost us if we are still in the critical avg duration time.
-	if (taskc->flush0_time < 500 * NSEC_PER_MSEC)
-		task_hint->hint = 1;
-	else {
-		task_hint->hint = 384;
-		p->scx.slice = 0;
-	}
-
-	return;
 }
 
 static __noinline bool match_one(struct layer_match *match,
@@ -2703,24 +2657,12 @@ void on_wakeup(struct task_struct *p, struct task_ctx *taskc)
 
 void BPF_STRUCT_OPS(layered_runnable, struct task_struct *p, u64 enq_flags)
 {
-	struct task_hint *task_hint = bpf_task_storage_get(&scx_layered_task_hint_map, p, NULL, 0);
 	struct task_ctx *taskc;
 	u64 now = scx_bpf_now();
 
 	if (!(taskc = lookup_task_ctx(p)))
 		return;
 
-	if (!task_hint)
-		goto end;
-
-	bool psp = task_hint->hint == 640;
-	bool idle = task_hint->hint == 768;
-
-	if (idle || psp) {
-		taskc->flush0_time = 0;
-		goto end;
-	}
-end:
 	taskc->runnable_at = now;
 	maybe_refresh_layer(p, taskc);
 
@@ -2823,10 +2765,10 @@ u64 remap_hint(u64 hint)
 
 void BPF_STRUCT_OPS(layered_stopping, struct task_struct *p, bool runnable)
 {
-	struct task_hint *task_hint = bpf_task_storage_get(&scx_layered_task_hint_map, p, NULL, 0);
 	struct cpu_ctx *cpuc;
 	struct task_ctx *taskc;
 	struct layer *task_layer;
+	// struct task_hint *task_hint;
 	u64 now = scx_bpf_now();
 	u64 usage_since_idle;
 	s32 task_lid;
@@ -2843,45 +2785,6 @@ void BPF_STRUCT_OPS(layered_stopping, struct task_struct *p, bool runnable)
 	taskc->runtime_avg =
 		((RUNTIME_DECAY_FACTOR - 1) * taskc->runtime_avg + runtime) /
 		RUNTIME_DECAY_FACTOR;
-
-	if (!task_hint)
-		goto skip;
-	// We're coming from a sequence of idle->runnable->flush0 = 0, multiple
-	// ticks on running (0 or more), and then reaching here when we're going
-	// off CPU.
-	bool flush0 = task_hint->hint == 1;
-	bool non_psp = task_hint->hint == 384;
-	bool psp = task_hint->hint == 640;
-	bool idle = task_hint->hint == 768;
-
-	// We can just skip, nothing to do here, we didn't transition to do any
-	// work at all.
-	if (idle || psp) {
-		taskc->flush0_time = 0;
-		goto skip;
-	}
-	// If we are flush0, we definitely set the hint in the tick() and
-	// accumulated flush0 time from there, so we can also skip.
-	if (flush0) {
-		if (taskc->flush0_time > 500 * NSEC_PER_MSEC) {
-			task_hint->hint = 384;
-		}
-		goto skip;
-	}
-
-	if (non_psp) {
-		// We may never have seen a tick and come here. Let's mark
-		// ourselves critical for next wake up if the flush0 time is
-		// less than 500 msec.
-		if (!taskc->flush0_time)
-			taskc->flush0_time = runtime;
-		if (taskc->flush0_time < 500 * NSEC_PER_MSEC) {
-			task_hint->hint = 1;
-		}
-		// TODO(kkd): Here we can try EDF for non-psp.
-	}
-
-skip:
 
 	account_used(cpuc, taskc, now);
 
