@@ -2240,17 +2240,6 @@ void BPF_STRUCT_OPS(layered_tick, struct task_struct *p)
 		return;
 
 	account_used(cpuc, taskc, scx_bpf_now());
-
-	if (!scx_bpf_dsq_nr_queued(cpuc->hi_fb_dsq_id))
-		return;
-	struct task_hint *hint = bpf_task_storage_get(&scx_layered_task_hint_map, p, NULL, 0);
-	if (!hint || hint->hint > 512) {
-		p->scx.slice = 0;
-		return;
-	}
-	if (hint && scx_bpf_now() - taskc->running_at > 10 * NSEC_PER_MSEC) {
-		p->scx.slice = 0;
-	}
 }
 
 static __noinline bool match_one(struct layer_match *match,
