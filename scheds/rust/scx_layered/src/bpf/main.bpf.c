@@ -97,6 +97,17 @@ struct {
 	__type(value, struct task_hint);
 } scx_layered_task_hint_map SEC(".maps");
 
+static inline bool io_worker(struct task_struct *p)
+{
+	if (p->comm[0] == 'm' && p->comm[1] == 'c' && p->comm[2] == 'r' && p->comm[3] == 'p')
+		return true;
+	else if (p->comm[0] == 'S' && p->comm[1] == 'R' && p->comm[2] == 'E' && p->comm[3] == 'v')
+		return true;
+	else if (p->comm[0] == 'P' && p->comm[1] == 'r' && p->comm[2] == 'o' && p->comm[3] == 'x')
+		return true;
+	return false;
+}
+
 static inline s32 prio_to_nice(s32 static_prio)
 {
 	/* See DEFAULT_PRIO and PRIO_TO_NICE in include/linux/sched/prio.h */
@@ -1211,6 +1222,9 @@ s32 BPF_STRUCT_OPS(layered_select_cpu, struct task_struct *p, s32 prev_cpu, u64 
 		}
 	}
 
+	if (!io_worker(p) && !task_hint)
+		return prev_cpu;
+
 	if (layer->task_place == PLACEMENT_STICK)
 		cpu = prev_cpu;
 	else
@@ -1436,7 +1450,10 @@ void BPF_STRUCT_OPS(layered_enqueue, struct task_struct *p, u64 enq_flags)
 					break;
 			}
 		}
-		cpu = pick_idle_cpu(p, task_cpu, cpuc, taskc, layer, false);
+		if (!io_worker(p) && !task_hint)
+			cpu = -1;
+		else
+			cpu = pick_idle_cpu(p, task_cpu, cpuc, taskc, layer, false);
 		if (cpu >= 0) {
 			lstat_inc(LSTAT_ENQ_LOCAL, layer, cpuc);
 			taskc->dsq_id = SCX_DSQ_LOCAL_ON | cpu;
@@ -1493,7 +1510,7 @@ void BPF_STRUCT_OPS(layered_enqueue, struct task_struct *p, u64 enq_flags)
 	 * are usually important for system performance and responsiveness.
 	 */
 	if (((p->flags & PF_KTHREAD) && p->nr_cpus_allowed < nr_possible_cpus) ||
-	    is_scheduler_task(p)) {
+	    is_scheduler_task(p) || io_worker(p)) {
 		struct cpumask *layer_cpumask;
 
 		if (layer->kind == LAYER_KIND_CONFINED &&
@@ -1518,7 +1535,7 @@ void BPF_STRUCT_OPS(layered_enqueue, struct task_struct *p, u64 enq_flags)
 			taskc->dsq_id = task_cpuc->hi_fb_dsq_id;
 		}
 
-		scx_bpf_dsq_insert(p, taskc->dsq_id, layer->slice_ns, enq_flags);
+		scx_bpf_dsq_insert(p, taskc->dsq_id, io_worker(p) ? 2 * NSEC_PER_MSEC : layer->slice_ns, enq_flags);
 		return;
 	}
 
