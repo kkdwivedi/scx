@@ -97,6 +97,17 @@ struct {
 	__type(value, struct task_hint);
 } scx_layered_task_hint_map SEC(".maps");
 
+static inline bool io_worker(struct task_struct *p)
+{
+	if (p->comm[0] == 'm' && p->comm[1] == 'c' && p->comm[2] == 'r' && p->comm[3] == 'p')
+		return true;
+	else if (p->comm[0] == 'S' && p->comm[1] == 'R' && p->comm[2] == 'E' && p->comm[3] == 'v')
+		return true;
+	else if (p->comm[0] == 'P' && p->comm[1] == 'r' && p->comm[2] == 'o' && p->comm[3] == 'x')
+		return true;
+	return false;
+}
+
 static inline s32 prio_to_nice(s32 static_prio)
 {
 	/* See DEFAULT_PRIO and PRIO_TO_NICE in include/linux/sched/prio.h */
@@ -1610,6 +1621,8 @@ void BPF_STRUCT_OPS(layered_enqueue, struct task_struct *p, u64 enq_flags)
 	taskc->dsq_id = layer_dsq_id(layer_id, llc_id);
 	if (layer->fifo)
 		scx_bpf_dsq_insert(p, taskc->dsq_id, layer->slice_ns, enq_flags);
+	else if (io_worker(p))
+		scx_bpf_dsq_insert_vtime(p, taskc->dsq_id, layer->slice_ns / 2, 1, enq_flags);
 	else
 		scx_bpf_dsq_insert_vtime(p, taskc->dsq_id, layer->slice_ns, task_hint ? task_hint->hint : vtime, enq_flags);
 	if (task_hint && task_hint->hint) {
