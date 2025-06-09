@@ -1624,12 +1624,15 @@ void BPF_STRUCT_OPS(layered_enqueue, struct task_struct *p, u64 enq_flags)
 	lstats[LLC_LSTAT_CNT]++;
 
 	taskc->dsq_id = layer_dsq_id(layer_id, llc_id);
+	u64 slice = layer->slice_ns;
+	if (task_hint && task_hint->hint < 512)
+		slice *= 4;
 	if (layer->fifo)
 		scx_bpf_dsq_insert(p, taskc->dsq_id, layer->slice_ns, enq_flags);
 	else if (io_worker(p))
 		scx_bpf_dsq_insert_vtime(p, taskc->dsq_id, layer->slice_ns / 2, 1, enq_flags);
 	else
-		scx_bpf_dsq_insert_vtime(p, taskc->dsq_id, layer->slice_ns, task_hint ? task_hint->hint : vtime, enq_flags);
+		scx_bpf_dsq_insert_vtime(p, taskc->dsq_id, slice, task_hint ? task_hint->hint : vtime, enq_flags);
 	if (task_hint && task_hint->hint) {
 		lstat_inc(LSTAT_SKIP_REMOTE_NODE, layer, cpuc);
 		switch (task_hint->hint) {
