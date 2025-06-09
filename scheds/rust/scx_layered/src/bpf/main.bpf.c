@@ -1222,6 +1222,8 @@ s32 BPF_STRUCT_OPS(layered_select_cpu, struct task_struct *p, s32 prev_cpu, u64 
 				lstat_inc(LSTAT_PREEMPT_XLLC, layer, cpuc);
 				break;
 		}
+		if (task_hint->hint == 640 || task_hint->hint == 768)
+			return prev_cpu;
 	}
 
 	if (layer->task_place == PLACEMENT_STICK)
@@ -1440,7 +1442,10 @@ void BPF_STRUCT_OPS(layered_enqueue, struct task_struct *p, u64 enq_flags)
 					break;
 			}
 		}
-		cpu = pick_idle_cpu(p, task_cpu, cpuc, taskc, layer, false);
+		if (task_hint && (task_hint->hint == 640 || task_hint->hint == 768))
+			cpu = -1;
+		else
+			cpu = pick_idle_cpu(p, task_cpu, cpuc, taskc, layer, false);
 		if (cpu >= 0) {
 			lstat_inc(LSTAT_ENQ_LOCAL, layer, cpuc);
 			taskc->dsq_id = SCX_DSQ_LOCAL_ON | cpu;
