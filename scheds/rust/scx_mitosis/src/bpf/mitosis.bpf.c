@@ -542,6 +542,13 @@ static inline int update_task_cpumask(struct task_struct *p,
 			effective_cpumask = subcell_mask;
 	}
 
+	/*
+	 * Re-check after the subcell branch so the verifier can prove
+	 * tctx->cpumask is non-NULL at the bpf_cpumask_and call site.
+	 */
+	if (!tctx->cpumask)
+		return -EINVAL;
+
 	bpf_cpumask_and(tctx->cpumask, effective_cpumask, p->cpus_ptr);
 
 	if (cell_cpumask)
