@@ -11,9 +11,11 @@
 //! CPU partitioning.
 
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::io::{AsFd, BorrowedFd};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
+use inotify::{Inotify, WatchMask};
 use regex::Regex;
 use scx_utils::Cpumask;
 use serde::Deserialize;
@@ -99,6 +101,10 @@ pub struct ProfileManager {
     free_cell_ids: Vec<u32>,
     next_subcell_id: u32,
     all_cpus: Cpumask,
+    /// Inotify instance for watching cgroup directories
+    inotify: Option<Inotify>,
+    /// Compiled regexes for template cells, keyed by spec index
+    template_regexes: Vec<(usize, Regex)>,
 }
 
 impl ProfileManager {
@@ -119,6 +125,8 @@ impl ProfileManager {
             free_cell_ids: Vec::new(),
             next_subcell_id: 1, // subcell 0 means "no subcell"
             all_cpus,
+            inotify: None,
+            template_regexes: Vec::new(),
         };
 
         // Always create cell 0 (root)
@@ -134,6 +142,7 @@ impl ProfileManager {
         });
 
         mgr.resolve_cells()?;
+        mgr.setup_inotify()?;
 
         Ok(mgr)
     }
@@ -603,6 +612,213 @@ impl ProfileManager {
             parts.push(format!("[{}({}): {}{}]", assignment.cell_id, name, cpulist, sc_info));
         }
         parts.join(" ")
+    }
+
+    /// Set up inotify watches for template cgroup directories.
+    fn setup_inotify(&mut self) -> Result<()> {
+        let mut has_templates = false;
+
+        // Compile template regexes and check if we need watching
+        for (idx, cell_spec) in self.spec.cells.iter().enumerate() {
+            match &cell_spec.template_match {
+                Some(TaskMatch::CgroupRegex(pattern)) => {
+                    let re = Regex::new(pattern).with_context(|| {
+                        format!("Invalid regex '{}' in cell '{}'", pattern, cell_spec.name)
+                    })?;
+                    self.template_regexes.push((idx, re));
+                    has_templates = true;
+                }
+                Some(TaskMatch::CgroupContains(_)) => {
+                    has_templates = true;
+                }
+                _ => {}
+            }
+        }
+
+        if !has_templates {
+            return Ok(());
+        }
+
+        let inotify = Inotify::init().context("Failed to initialize inotify for profile")?;
+
+        // Watch /sys/fs/cgroup for new subdirectory creation/deletion
+        inotify
+            .watches()
+            .add(
+                "/sys/fs/cgroup",
+                WatchMask::CREATE | WatchMask::DELETE | WatchMask::MOVED_TO | WatchMask::MOVED_FROM,
+            )
+            .context("Failed to add inotify watch on /sys/fs/cgroup")?;
+
+        self.inotify = Some(inotify);
+        debug!("Set up inotify watch on /sys/fs/cgroup for template re-expansion");
+
+        Ok(())
+    }
+
+    /// Process pending inotify events and re-expand templates.
+    /// Returns true if any cells were added or removed.
+    pub fn process_events(&mut self) -> Result<bool> {
+        let inotify = match &mut self.inotify {
+            Some(ino) => ino,
+            None => return Ok(false),
+        };
+
+        let mut buffer = [0; 4096];
+        let mut has_events = false;
+
+        loop {
+            match inotify.read_events(&mut buffer) {
+                Ok(events) => {
+                    if events.into_iter().next().is_some() {
+                        has_events = true;
+                    } else {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => return Err(e).context("Failed to read inotify events"),
+            }
+        }
+
+        if !has_events {
+            return Ok(false);
+        }
+
+        self.reconcile_template_cells()
+    }
+
+    /// Reconcile template cells with current cgroup state.
+    fn reconcile_template_cells(&mut self) -> Result<bool> {
+        let specs = self.spec.cells.clone();
+        let mut changed = false;
+
+        for cell_spec in &specs {
+            match &cell_spec.template_match {
+                Some(TaskMatch::CgroupRegex(pattern)) => {
+                    let re = Regex::new(pattern)?;
+                    let cgroup_root = PathBuf::from("/sys/fs/cgroup");
+                    if self.reconcile_regex_template(cell_spec, &cgroup_root, &re)? {
+                        changed = true;
+                    }
+                }
+                Some(TaskMatch::CgroupContains(substring)) => {
+                    let cgroup_root = PathBuf::from("/sys/fs/cgroup");
+                    if self.reconcile_contains_template(cell_spec, &cgroup_root, substring)? {
+                        changed = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Remove cells whose cgroup paths no longer exist
+        let mut removed_ids = Vec::new();
+        self.resolved_cells.retain(|cell| {
+            if cell.cell_id == 0 {
+                return true;
+            }
+            if let Some(ref path) = cell.cgroup_path {
+                if !path.exists() {
+                    info!(
+                        "Cgroup removed, destroying cell '{}' (id={})",
+                        cell.name, cell.cell_id
+                    );
+                    removed_ids.push(cell.cell_id);
+                    return false;
+                }
+            }
+            true
+        });
+
+        if !removed_ids.is_empty() {
+            self.free_cell_ids.extend(removed_ids);
+            changed = true;
+        }
+
+        Ok(changed)
+    }
+
+    fn reconcile_regex_template(
+        &mut self,
+        spec: &CellSpec,
+        dir: &Path,
+        re: &Regex,
+    ) -> Result<bool> {
+        let mut changed = false;
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return Ok(false),
+        };
+
+        for entry in entries {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let path = entry.path();
+            let rel_path = path
+                .strip_prefix("/sys/fs/cgroup")
+                .unwrap_or(&path)
+                .to_string_lossy();
+
+            if re.is_match(&rel_path) {
+                let cgid = path.metadata()?.ino();
+                if !self.resolved_cells.iter().any(|c| c.cgid == Some(cgid)) {
+                    self.create_cell_for_cgroup(spec, &path)?;
+                    changed = true;
+                }
+            }
+
+            if self.reconcile_regex_template(spec, &path, re)? {
+                changed = true;
+            }
+        }
+        Ok(changed)
+    }
+
+    fn reconcile_contains_template(
+        &mut self,
+        spec: &CellSpec,
+        dir: &Path,
+        substring: &str,
+    ) -> Result<bool> {
+        let mut changed = false;
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return Ok(false),
+        };
+
+        for entry in entries {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.contains(substring) {
+                let cgid = path.metadata()?.ino();
+                if !self.resolved_cells.iter().any(|c| c.cgid == Some(cgid)) {
+                    self.create_cell_for_cgroup(spec, &path)?;
+                    changed = true;
+                }
+            }
+            if self.reconcile_contains_template(spec, &path, substring)? {
+                changed = true;
+            }
+        }
+        Ok(changed)
+    }
+
+    /// Returns true if this profile manager has an inotify fd to watch.
+    pub fn has_inotify(&self) -> bool {
+        self.inotify.is_some()
+    }
+}
+
+impl AsFd for ProfileManager {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.inotify.as_ref().expect("no inotify").as_fd()
     }
 }
 

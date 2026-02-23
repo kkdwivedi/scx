@@ -69,6 +69,23 @@ impl CellMetrics {
 
 #[stat_doc]
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Stats)]
+#[stat(_om_prefix = "sc_")]
+#[stat(top)]
+pub struct SubcellMetrics {
+    #[stat(desc = "Subcell name")]
+    pub name: String,
+    #[stat(desc = "Parent cell ID")]
+    pub parent_cell: u32,
+    #[stat(desc = "Number of CPUs")]
+    pub num_cpus: u32,
+    #[stat(desc = "CPU utilization %")]
+    pub util_pct: f64,
+    #[stat(desc = "EWMA-smoothed utilization %")]
+    pub smoothed_util_pct: f64,
+}
+
+#[stat_doc]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Stats)]
 #[stat(top)]
 pub struct Metrics {
     #[stat(desc = "Number of cells")]
@@ -99,6 +116,8 @@ pub struct Metrics {
     pub rebalance_count: u64,
     #[stat(desc = "Per-cell metrics")] // TODO: cell names
     pub cells: BTreeMap<u32, CellMetrics>,
+    #[stat(desc = "Per-subcell metrics")]
+    pub subcells: BTreeMap<u32, SubcellMetrics>,
 }
 
 impl Metrics {
@@ -148,6 +167,7 @@ pub fn server_data() -> StatsServerData<(), Metrics> {
     StatsServerData::new()
         .add_meta(Metrics::meta())
         .add_meta(CellMetrics::meta())
+        .add_meta(SubcellMetrics::meta())
         .add_ops("top", StatsOps { open, close: None })
 }
 

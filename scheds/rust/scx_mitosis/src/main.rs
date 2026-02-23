@@ -57,12 +57,15 @@ use stats::Metrics;
 
 const SCHEDULER_NAME: &str = "scx_mitosis";
 const MAX_CELLS: usize = bpf_intf::consts_MAX_CELLS as usize;
+const MAX_TOTAL_SUBCELLS: usize = bpf_intf::consts_MAX_TOTAL_SUBCELLS as usize;
 const NR_CSTATS: usize = bpf_intf::cell_stat_idx_NR_CSTATS as usize;
 
 /// Epoll token for inotify events (cgroup creation/destruction)
 const INOTIFY_TOKEN: u64 = 1;
 /// Epoll token for stats request wakeups
 const STATS_TOKEN: u64 = 2;
+/// Epoll token for profile inotify events
+const PROFILE_INOTIFY_TOKEN: u64 = 3;
 
 /// scx_mitosis: A dynamic affinity scheduler
 ///
@@ -233,6 +236,10 @@ struct Scheduler<'a> {
     demand_smoothing: f64,
     /// EWMA-smoothed utilization per cell
     smoothed_util: [f64; MAX_CELLS],
+    /// Per-subcell running_ns tracking
+    prev_subcell_running_ns: [u64; MAX_TOTAL_SUBCELLS],
+    /// EWMA-smoothed utilization per subcell
+    smoothed_subcell_util: [f64; MAX_TOTAL_SUBCELLS],
     /// Last time rebalancing was performed
     last_rebalance: Instant,
     /// Number of rebalancing events
@@ -424,6 +431,16 @@ impl<'a> Scheduler<'a> {
             )?;
         }
 
+        // Register profile inotify fd if profile_manager has template watches
+        if let Some(ref pm) = profile_manager {
+            if pm.has_inotify() {
+                epoll.add(
+                    pm,
+                    EpollEvent::new(EpollFlags::EPOLLIN, PROFILE_INOTIFY_TOKEN),
+                )?;
+            }
+        }
+
         Ok(Self {
             skel,
             monitor_interval: Duration::from_secs(opts.monitor_interval_s),
@@ -444,6 +461,8 @@ impl<'a> Scheduler<'a> {
             rebalance_cooldown: Duration::from_secs(opts.rebalance_cooldown_s),
             demand_smoothing: opts.demand_smoothing,
             smoothed_util: [0.0; MAX_CELLS],
+            prev_subcell_running_ns: [0; MAX_TOTAL_SUBCELLS],
+            smoothed_subcell_util: [0.0; MAX_TOTAL_SUBCELLS],
             last_rebalance: Instant::now(),
             rebalance_count: 0,
             epoll,
@@ -495,6 +514,10 @@ impl<'a> Scheduler<'a> {
                                 let _ = self.stats_waker.read();
                                 res_ch.send(self.get_metrics())?;
                             }
+                            PROFILE_INOTIFY_TOKEN => {
+                                // Profile template cgroup event
+                                self.process_profile_events()?;
+                            }
                             _ => {}
                         }
                     }
@@ -510,6 +533,9 @@ impl<'a> Scheduler<'a> {
 
             if self.enable_rebalancing && self.cell_manager.is_some() {
                 self.maybe_rebalance()?;
+            }
+            if self.profile_manager.is_some() {
+                self.maybe_rebalance_subcells()?;
             }
         }
 
@@ -561,6 +587,32 @@ impl<'a> Scheduler<'a> {
 
         info!("Applied initial profile configuration: {}", config_str);
 
+        Ok(())
+    }
+
+    /// Process profile template events (new/destroyed cgroups matching templates).
+    fn process_profile_events(&mut self) -> Result<()> {
+        let pm = match &mut self.profile_manager {
+            Some(pm) => pm,
+            None => return Ok(()),
+        };
+
+        if !pm.process_events()? {
+            return Ok(());
+        }
+
+        // Re-expand templates changed things, recompute and apply config
+        let enable_borrowing = self.enable_borrowing;
+        let cpu_assignments = pm.compute_cpu_assignments(enable_borrowing)?;
+        pm.compute_subcell_cpu_assignments(&cpu_assignments)?;
+
+        let cell_assignments = pm.get_cell_assignments();
+        let config_str = pm.format_config(&cpu_assignments);
+
+        pm.build_subcell_config(&mut self.skel)?;
+        self.apply_cell_config(&cell_assignments, &cpu_assignments)?;
+
+        info!("Profile template re-expansion applied: {}", config_str);
         Ok(())
     }
 
@@ -691,6 +743,130 @@ impl<'a> Scheduler<'a> {
             spread,
             self.rebalance_count,
             cell_manager.format_cell_config(&cpu_assignments)
+        );
+
+        Ok(())
+    }
+
+    /// Check if subcell rebalancing should be triggered and re-partition CPUs within cells.
+    fn maybe_rebalance_subcells(&mut self) -> Result<()> {
+        // Reuse the same cooldown as cell-level rebalancing
+        if self.last_rebalance.elapsed() < self.rebalance_cooldown {
+            return Ok(());
+        }
+
+        let pm = match &mut self.profile_manager {
+            Some(pm) => pm,
+            None => return Ok(()),
+        };
+
+        if !pm.has_subcells() {
+            return Ok(());
+        }
+
+        // Check if any cell's subcells have sufficient utilization spread
+        let mut needs_rebalance = false;
+        for cell in &pm.resolved_cells {
+            if cell.subcells.len() < 2 {
+                continue;
+            }
+
+            let mut min_util = f64::MAX;
+            let mut max_util = f64::MIN;
+            for sc in &cell.subcells {
+                let util = self.smoothed_subcell_util[sc.global_subcell_id as usize];
+                if util < min_util {
+                    min_util = util;
+                }
+                if util > max_util {
+                    max_util = util;
+                }
+            }
+
+            if max_util - min_util >= self.rebalance_threshold {
+                needs_rebalance = true;
+                break;
+            }
+        }
+
+        if !needs_rebalance {
+            return Ok(());
+        }
+
+        // Recompute subcell CPU assignments using demand weights
+        let enable_borrowing = self.enable_borrowing;
+        let cpu_assignments = pm.compute_cpu_assignments(enable_borrowing)?;
+
+        // Recompute subcell partitioning with demand weights
+        for cell in &mut pm.resolved_cells {
+            if cell.subcells.len() < 2 {
+                continue;
+            }
+
+            let cell_assignment = cpu_assignments
+                .iter()
+                .find(|a| a.cell_id == cell.cell_id);
+            let cell_mask = match cell_assignment {
+                Some(a) => &a.primary,
+                None => continue,
+            };
+
+            let cell_cpus: Vec<usize> = cell_mask.iter().collect();
+            if cell_cpus.is_empty() {
+                continue;
+            }
+
+            // Build weights from smoothed utilization
+            let weights: Vec<(u32, f64)> = cell
+                .subcells
+                .iter()
+                .map(|sc| {
+                    (
+                        sc.global_subcell_id,
+                        self.smoothed_subcell_util[sc.global_subcell_id as usize],
+                    )
+                })
+                .collect();
+
+            // Use compute_targets for proportional distribution
+            let targets =
+                crate::cell_manager::compute_targets_pub(cell_cpus.len(), &weights)?;
+
+            let mut offset = 0;
+            // Sort subcells by ID for deterministic assignment
+            let mut sc_targets: Vec<(u32, usize)> = targets.into_iter().collect();
+            sc_targets.sort_by_key(|(id, _)| *id);
+
+            for (sc_id, count) in &sc_targets {
+                let sc = cell
+                    .subcells
+                    .iter_mut()
+                    .find(|s| s.global_subcell_id == *sc_id);
+                if let Some(sc) = sc {
+                    let mut mask = Cpumask::new();
+                    for j in 0..*count {
+                        if offset + j < cell_cpus.len() {
+                            mask.set_cpu(cell_cpus[offset + j]).ok();
+                        }
+                    }
+                    offset += count;
+                    sc.cpumask = Some(mask);
+                }
+            }
+        }
+
+        // Rebuild and apply config
+        let cell_assignments = pm.get_cell_assignments();
+        pm.build_subcell_config(&mut self.skel)?;
+        self.apply_cell_config(&cell_assignments, &cpu_assignments)?;
+
+        self.last_rebalance = Instant::now();
+        self.rebalance_count += 1;
+        self.metrics.rebalance_count = self.rebalance_count;
+
+        info!(
+            "Rebalanced subcells (count={})",
+            self.rebalance_count,
         );
 
         Ok(())
@@ -1144,6 +1320,72 @@ impl<'a> Scheduler<'a> {
 
         self.metrics
             .update_demand(global_util_pct, global_borrow_pct, global_lent_pct);
+
+        // Per-subcell utilization tracking
+        if self.profile_manager.is_some() {
+            self.collect_subcell_demand_metrics(cpu_ctxs, interval_ns)?;
+        }
+
+        Ok(())
+    }
+
+    /// Collect per-subcell demand metrics from BPF subcell_running_ns.
+    fn collect_subcell_demand_metrics(
+        &mut self,
+        cpu_ctxs: &[bpf_intf::cpu_ctx],
+        interval_ns: u64,
+    ) -> Result<()> {
+        let pm = match &self.profile_manager {
+            Some(pm) => pm,
+            None => return Ok(()),
+        };
+
+        for cell in &pm.resolved_cells {
+            for sc in &cell.subcells {
+                let sc_id = sc.global_subcell_id as usize;
+                if sc_id >= MAX_TOTAL_SUBCELLS {
+                    continue;
+                }
+
+                // Accumulate subcell running_ns from all CPUs
+                let mut total_sc_running = 0u64;
+                for cpu_ctx in cpu_ctxs.iter() {
+                    total_sc_running += cpu_ctx.subcell_running_ns[sc_id];
+                }
+
+                let delta = total_sc_running
+                    .wrapping_sub(self.prev_subcell_running_ns[sc_id]);
+                self.prev_subcell_running_ns[sc_id] = total_sc_running;
+
+                let sc_cpus = sc
+                    .cpumask
+                    .as_ref()
+                    .map(|m| m.weight() as u64)
+                    .unwrap_or(1);
+                let capacity = sc_cpus * interval_ns;
+                let util_pct = if capacity > 0 {
+                    100.0 * (delta as f64) / (capacity as f64)
+                } else {
+                    0.0
+                };
+
+                // EWMA smoothing
+                self.smoothed_subcell_util[sc_id] = self.demand_smoothing * util_pct
+                    + (1.0 - self.demand_smoothing) * self.smoothed_subcell_util[sc_id];
+
+                // Update subcell metrics
+                let sc_metrics = self
+                    .metrics
+                    .subcells
+                    .entry(sc_id as u32)
+                    .or_default();
+                sc_metrics.name = sc.name.clone();
+                sc_metrics.parent_cell = cell.cell_id;
+                sc_metrics.num_cpus = sc_cpus as u32;
+                sc_metrics.util_pct = util_pct;
+                sc_metrics.smoothed_util_pct = self.smoothed_subcell_util[sc_id];
+            }
+        }
 
         Ok(())
     }

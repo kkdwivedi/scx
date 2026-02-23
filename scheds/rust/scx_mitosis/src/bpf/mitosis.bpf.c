@@ -1643,6 +1643,14 @@ void BPF_STRUCT_OPS(mitosis_stopping, struct task_struct *p, bool runnable)
 		}
 		*running += used;
 	}
+
+	/* Track per-subcell running time */
+	if (enable_subcells && tctx->subcell > 0) {
+		u64 *sc_running =
+			MEMBER_VPTR(cctx->subcell_running_ns, [tctx->subcell]);
+		if (sc_running)
+			*sc_running += used;
+	}
 }
 
 SEC("fentry/cpuset_write_resmask")
