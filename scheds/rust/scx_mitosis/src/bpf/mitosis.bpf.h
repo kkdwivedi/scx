@@ -67,6 +67,8 @@ struct task_ctx {
 	u64 basis_vtime;
 	/* For the sake of monitoring, each task is owned by a cell */
 	u32 cell;
+	/* Global subcell ID (0 = no subcell, uses cell-level scheduling) */
+	u32 subcell;
 	/* For the sake of scheduling, a task is exclusively owned by either a cell
 	 * or a cpu */
 	dsq_id_t dsq;

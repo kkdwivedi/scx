@@ -72,6 +72,7 @@
 #define CPU_B 28
 #define LLC_B 16
 #define CELL_B 12
+#define SUBCELL_B 12
 #define TYPE_B 4
 #define DATA_B 28
 #define RSVD_B 32
@@ -80,6 +81,8 @@
 _Static_assert(CPU_B + TYPE_B == 32, "CPU layout low half must be 32 bits");
 _Static_assert(LLC_B + CELL_B + TYPE_B == 32,
 	       "CELL+LLC layout low half must be 32 bits");
+_Static_assert(LLC_B + SUBCELL_B + TYPE_B == 32,
+	       "SUBCELL+LLC layout low half must be 32 bits");
 _Static_assert(DATA_B + TYPE_B == 32, "Common layout low half must be 32 bits");
 
 typedef union {
@@ -99,6 +102,14 @@ typedef union {
 		u64 type : TYPE_B;
 		u64 rsvd : RSVD_B;
 	} cell_llc_dsq;
+
+	/* Subcell+LLC user DSQ */
+	struct {
+		u64 llc : LLC_B;
+		u64 subcell : SUBCELL_B;
+		u64 type : TYPE_B;
+		u64 rsvd : RSVD_B;
+	} subcell_llc_dsq;
 
 	/* Generic user view */
 	struct {
@@ -144,14 +155,17 @@ enum dsq_type {
 	DSQ_TYPE_NONE,
 	DSQ_TYPE_CPU,
 	DSQ_TYPE_CELL_LLC,
+	DSQ_TYPE_SUBCELL_LLC,
 };
 
 /* Range guards */
 _Static_assert(MAX_CPUS <= (1u << CPU_B), "MAX_CPUS must fit in field");
 _Static_assert(MAX_LLCS <= (1u << LLC_B), "MAX_LLCS must fit in field");
 _Static_assert(MAX_CELLS <= (1u << CELL_B), "MAX_CELLS must fit in field");
-_Static_assert(DSQ_TYPE_CELL_LLC < (1u << TYPE_B),
-	       "DSQ_TYPE_CELL_LLC must fit in field");
+_Static_assert(MAX_TOTAL_SUBCELLS <= (1u << SUBCELL_B),
+	       "MAX_TOTAL_SUBCELLS must fit in field");
+_Static_assert(DSQ_TYPE_SUBCELL_LLC < (1u << TYPE_B),
+	       "DSQ_TYPE_SUBCELL_LLC must fit in field");
 
 static inline bool dsq_is_invalid(dsq_id_t dsq_id)
 {
@@ -204,4 +218,16 @@ static inline dsq_id_t get_cell_llc_dsq_id(u32 cell, u32 llc)
 	return (dsq_id_t){ .cell_llc_dsq = { .llc  = llc,
 					     .cell = cell,
 					     .type = DSQ_TYPE_CELL_LLC } };
+}
+
+static inline dsq_id_t get_subcell_llc_dsq_id(u32 subcell, u32 llc)
+{
+	if (subcell >= MAX_TOTAL_SUBCELLS || llc >= MAX_LLCS) {
+		scx_bpf_error("subcell %u or llc %u too large", subcell, llc);
+		return DSQ_INVALID;
+	}
+
+	return (dsq_id_t){ .subcell_llc_dsq = { .llc     = llc,
+						.subcell = subcell,
+						.type    = DSQ_TYPE_SUBCELL_LLC } };
 }

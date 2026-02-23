@@ -29,6 +29,13 @@ enum consts {
 
 	/* Size of cpumask in unsigned longs (supports up to 8192 CPUs) */
 	CPUMASK_LONG_ENTRIES = 128,
+
+	/* Subcell limits */
+	MAX_SUBCELLS_PER_CELL = 16,
+	MAX_TOTAL_SUBCELLS    = 64,
+	MAX_SUBCELL_MATCH_ORS = 8,
+	MAX_SUBCELL_MATCH_ANDS = 8,
+	MAX_MATCH_STR	      = 16,
 };
 
 /*
@@ -65,6 +72,28 @@ struct debug_event {
 	};
 };
 
+/* Subcell task matching */
+enum subcell_match_kind {
+	SUBCELL_MATCH_COMM_PREFIX,
+	NR_SUBCELL_MATCH_KINDS,
+};
+
+struct subcell_match {
+	u32  kind;
+	char str[MAX_MATCH_STR];
+	u32  int_val;
+};
+
+struct subcell_match_ands {
+	u32 nr_rules;
+	struct subcell_match rules[MAX_SUBCELL_MATCH_ANDS];
+};
+
+struct subcell_match_set {
+	u32 nr_groups;
+	struct subcell_match_ands groups[MAX_SUBCELL_MATCH_ORS];
+};
+
 /* Statistics */
 enum cell_stat_idx {
 	CSTAT_LOCAL,
@@ -83,6 +112,7 @@ struct cpu_ctx {
 	u64 vtime_now;
 	u32 cell;
 	u32 llc;
+	u32 subcell; /* global subcell ID (0 = no subcell) */
 };
 
 struct cgrp_ctx {
@@ -138,6 +168,11 @@ struct cell {
 	// Number of LLCs with at least one CPU in this cell
 	u32 llc_present_cnt;
 
+	// Number of subcells within this cell (0 = no subcells)
+	u32 num_subcells;
+	// First global subcell ID for this cell (subcells are contiguous)
+	u32 subcell_base_id;
+
 	// Per-LLC data (cacheline-aligned)
 	struct cell_llc llcs[MAX_LLCS];
 };
@@ -157,6 +192,7 @@ _Static_assert(_Alignof(CELL_LOCK_T) == 4,
 	       "lock/padding must be 4-byte aligned");
 
 // Verify these are the same size in both BPF and Rust.
+// cell = cacheline (lock + fields) + MAX_LLCS * cacheline
 _Static_assert(sizeof(struct cell) ==
 		       (CACHELINE_SIZE + (CACHELINE_SIZE * MAX_LLCS)),
 	       "struct cell size must be stable for Rust bindings");
@@ -186,6 +222,25 @@ struct cell_config {
 	struct cell_assignment	 assignments[MAX_CELLS];
 	struct cell_cpumask_data cpumasks[MAX_CELLS];
 	struct cell_cpumask_data borrowable_cpumasks[MAX_CELLS];
+};
+
+/* Subcell configuration populated by userspace */
+struct subcell_assignment {
+	u32 subcell_id;    /* global subcell ID (1..MAX_TOTAL_SUBCELLS) */
+	u32 parent_cell;   /* which cell this subcell belongs to */
+};
+
+struct subcell_config {
+	u32 num_subcells;
+	struct subcell_assignment assignments[MAX_TOTAL_SUBCELLS];
+	struct cell_cpumask_data  cpumasks[MAX_TOTAL_SUBCELLS];
+};
+
+/* Subcell spec for BPF-side task matching (populated by userspace before load) */
+struct subcell_spec {
+	u32 parent_cell;
+	u32 subcell_id;   /* global subcell ID */
+	struct subcell_match_set matches;
 };
 
 #endif /* __INTF_H */

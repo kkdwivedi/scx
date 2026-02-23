@@ -79,6 +79,38 @@ struct {
 /* Configuration struct for apply_cell_config, populated by userspace */
 struct cell_config cell_config;
 
+/* Subcell configuration, populated by userspace */
+struct subcell_config subcell_config;
+
+/* Subcell state (BPF array map) */
+struct subcell {
+	u32 in_use;
+	u32 parent_cell;
+	u64 vtime_now;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, u32);
+	__type(value, struct subcell);
+	__uint(max_entries, MAX_TOTAL_SUBCELLS);
+} subcells SEC(".maps");
+
+/* Per-subcell cpumask wrappers (same kptr pattern as cell_cpumasks) */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, u32);
+	__type(value, struct cell_cpumask_wrapper);
+	__uint(max_entries, MAX_TOTAL_SUBCELLS);
+	__uint(map_flags, 0);
+} subcell_cpumasks SEC(".maps");
+
+/* Subcell specs for BPF-side task matching (BSS, populated by userspace before load) */
+struct subcell_spec subcell_specs[MAX_TOTAL_SUBCELLS];
+u32 nr_subcell_specs;
+
+const volatile bool enable_subcells = false;
+
 struct update_timer {
 	struct bpf_timer timer;
 };
@@ -392,10 +424,103 @@ static void cstat_inc(enum cell_stat_idx idx, u32 cell, struct cpu_ctx *cctx)
 	cstat_add(idx, cell, cctx, 1);
 }
 
+/*
+ * Subcell task matching functions.
+ * OR-of-ANDs: a task matches a subcell if ANY group matches,
+ * and a group matches if ALL rules in it match.
+ */
+static inline bool subcell_match_one(struct subcell_match *m,
+				     struct task_struct *p)
+{
+	char comm[MAX_MATCH_STR] = {};
+	u32 len;
+
+	switch (m->kind) {
+	case SUBCELL_MATCH_COMM_PREFIX:
+		bpf_probe_read_kernel_str(comm, sizeof(comm), p->comm);
+		len = 0;
+		bpf_for(len, 0, MAX_MATCH_STR)
+		{
+			if (m->str[len] == '\0')
+				return true;
+			if (comm[len] != m->str[len])
+				return false;
+		}
+		return true;
+	default:
+		return false;
+	}
+}
+
+static inline bool subcell_match_ands_eval(struct subcell_match_ands *ands,
+					   struct task_struct *p)
+{
+	u32 i;
+	bpf_for(i, 0, MAX_SUBCELL_MATCH_ANDS)
+	{
+		if (i >= ands->nr_rules)
+			break;
+		struct subcell_match *m = &ands->rules[i];
+		if (!subcell_match_one(m, p))
+			return false;
+	}
+	return true;
+}
+
+static inline bool subcell_match_set_eval(struct subcell_match_set *set,
+					  struct task_struct *p)
+{
+	u32 i;
+	bpf_for(i, 0, MAX_SUBCELL_MATCH_ORS)
+	{
+		if (i >= set->nr_groups)
+			break;
+		if (subcell_match_ands_eval(&set->groups[i], p))
+			return true;
+	}
+	return false;
+}
+
+/*
+ * After cell assignment, evaluate subcell specs to determine subcell placement.
+ * Returns the global subcell ID (0 = no subcell match).
+ */
+static inline u32 evaluate_subcell_match(struct task_struct *p, u32 cell_id)
+{
+	u32 i;
+	bpf_for(i, 0, MAX_TOTAL_SUBCELLS)
+	{
+		if (i >= nr_subcell_specs)
+			break;
+		struct subcell_spec *spec = &subcell_specs[i];
+		if (spec->parent_cell != cell_id)
+			continue;
+		if (subcell_match_set_eval(&spec->matches, p))
+			return spec->subcell_id;
+	}
+	return 0;
+}
+
+static inline const struct cpumask *lookup_subcell_cpumask(u32 subcell_id)
+{
+	struct cell_cpumask_wrapper *cpumaskw;
+
+	if (!(cpumaskw = bpf_map_lookup_elem(&subcell_cpumasks, &subcell_id))) {
+		scx_bpf_error("no subcell cpumask for subcell %d", subcell_id);
+		return NULL;
+	}
+
+	if (!cpumaskw->cpumask)
+		return NULL;
+
+	return (const struct cpumask *)cpumaskw->cpumask;
+}
+
 static inline int update_task_cpumask(struct task_struct *p,
 				      struct task_ctx	 *tctx)
 {
 	const struct cpumask *cell_cpumask;
+	const struct cpumask *effective_cpumask;
 	struct cpu_ctx	     *cpu_ctx;
 	u32		      cpu;
 
@@ -405,11 +530,23 @@ static inline int update_task_cpumask(struct task_struct *p,
 	if (!tctx->cpumask)
 		return -EINVAL;
 
-	bpf_cpumask_and(tctx->cpumask, cell_cpumask, p->cpus_ptr);
+	/*
+	 * If the task has a subcell, use the subcell cpumask instead
+	 * of the cell cpumask for primary CPU selection.
+	 */
+	effective_cpumask = cell_cpumask;
+	if (enable_subcells && tctx->subcell > 0) {
+		const struct cpumask *subcell_mask =
+			lookup_subcell_cpumask(tctx->subcell);
+		if (subcell_mask && !bpf_cpumask_empty(subcell_mask))
+			effective_cpumask = subcell_mask;
+	}
+
+	bpf_cpumask_and(tctx->cpumask, effective_cpumask, p->cpus_ptr);
 
 	if (cell_cpumask)
 		tctx->all_cell_cpus_allowed =
-			bpf_cpumask_subset(cell_cpumask, p->cpus_ptr);
+			bpf_cpumask_subset(effective_cpumask, p->cpus_ptr);
 
 	if (tctx->all_cell_cpus_allowed && enable_borrowing) {
 		const struct cpumask *borrowable =
@@ -466,15 +603,29 @@ static inline int update_task_cpumask(struct task_struct *p,
 	}
 
 	/* Non-LLC aware version */
-	tctx->dsq = get_cell_llc_dsq_id(tctx->cell, FAKE_FLAT_CELL_LLC);
+	if (enable_subcells && tctx->subcell > 0) {
+		tctx->dsq = get_subcell_llc_dsq_id(tctx->subcell,
+						    FAKE_FLAT_CELL_LLC);
+	} else {
+		tctx->dsq = get_cell_llc_dsq_id(tctx->cell,
+						 FAKE_FLAT_CELL_LLC);
+	}
 	if (dsq_is_invalid(tctx->dsq))
 		return -EINVAL;
 
-	struct cell *cell;
-	if (!(cell = lookup_cell(tctx->cell)))
-		return -ENOENT;
-
-	p->scx.dsq_vtime = READ_ONCE(cell->llcs[FAKE_FLAT_CELL_LLC].vtime_now);
+	if (enable_subcells && tctx->subcell > 0) {
+		struct subcell *sc;
+		sc = bpf_map_lookup_elem(&subcells, &tctx->subcell);
+		if (!sc)
+			return -ENOENT;
+		p->scx.dsq_vtime = READ_ONCE(sc->vtime_now);
+	} else {
+		struct cell *cell;
+		if (!(cell = lookup_cell(tctx->cell)))
+			return -ENOENT;
+		p->scx.dsq_vtime =
+			READ_ONCE(cell->llcs[FAKE_FLAT_CELL_LLC].vtime_now);
+	}
 
 	return 0;
 }
@@ -528,6 +679,17 @@ static inline int update_task_cell(struct task_struct *p, struct task_ctx *tctx,
 	barrier();
 	tctx->cell = cgc->cell;
 	tctx->cgid = cg->kn->id;
+
+	/* Evaluate subcell assignment if subcells are enabled */
+	if (enable_subcells) {
+		struct cell *cell = lookup_cell(tctx->cell);
+		if (cell && cell->num_subcells > 0)
+			tctx->subcell = evaluate_subcell_match(p, tctx->cell);
+		else
+			tctx->subcell = 0;
+	} else {
+		tctx->subcell = 0;
+	}
 
 	return update_task_cpumask(p, tctx);
 }
@@ -781,7 +943,17 @@ void BPF_STRUCT_OPS(mitosis_enqueue, struct task_struct *p, u64 enq_flags)
 		if (!(cell = lookup_cell(tctx->cell)))
 			return;
 
-		if (enable_llc_awareness) {
+		/*
+		 * If task belongs to a subcell, use subcell vtime.
+		 * Otherwise use cell-level vtime.
+		 */
+		if (enable_subcells && tctx->subcell > 0) {
+			struct subcell *sc;
+			sc = bpf_map_lookup_elem(&subcells, &tctx->subcell);
+			if (!sc)
+				return;
+			basis_vtime = READ_ONCE(sc->vtime_now);
+		} else if (enable_llc_awareness) {
 			if (!llc_is_valid(tctx->llc)) {
 				scx_bpf_error("Invalid LLC ID: %d", tctx->llc);
 				return;
@@ -854,9 +1026,53 @@ void BPF_STRUCT_OPS(mitosis_dispatch, s32 cpu, struct task_struct *prev)
 		return;
 	}
 
+	/*
+	 * If this CPU has a subcell, first check the subcell's DSQ
+	 * and sibling subcell DSQs within the same cell.
+	 */
+	if (enable_subcells && cctx->subcell > 0) {
+		/* Check own subcell DSQ first */
+		dsq_id_t own_sc_dsq = get_subcell_llc_dsq_id(cctx->subcell, llc);
+		if (!dsq_is_invalid(own_sc_dsq)) {
+			p = __COMPAT_scx_bpf_dsq_peek(own_sc_dsq.raw);
+			if (p) {
+				min_vtime     = p->scx.dsq_vtime;
+				min_vtime_dsq = own_sc_dsq;
+				found	      = true;
+			}
+		}
+
+		/* Check sibling subcell DSQs (overcommit) */
+		struct cell *cell_ptr = lookup_cell(cell);
+		if (cell_ptr && cell_ptr->num_subcells > 0) {
+			u32 base = cell_ptr->subcell_base_id;
+			u32 count = cell_ptr->num_subcells;
+			u32 si;
+			bpf_for(si, 0, MAX_SUBCELLS_PER_CELL)
+			{
+				if (si >= count)
+					break;
+				u32 sc_id = base + si;
+				if (sc_id == cctx->subcell)
+					continue; /* already checked */
+				if (sc_id >= MAX_TOTAL_SUBCELLS)
+					break;
+				dsq_id_t sc_dsq = get_subcell_llc_dsq_id(sc_id, llc);
+				if (dsq_is_invalid(sc_dsq))
+					continue;
+				p = __COMPAT_scx_bpf_dsq_peek(sc_dsq.raw);
+				if (p && (!found || time_before(p->scx.dsq_vtime, min_vtime))) {
+					min_vtime     = p->scx.dsq_vtime;
+					min_vtime_dsq = sc_dsq;
+					found	      = true;
+				}
+			}
+		}
+	}
+
 	/* Peek at cell-LLC DSQ head */
 	p = __COMPAT_scx_bpf_dsq_peek(cell_dsq.raw);
-	if (p) {
+	if (p && (!found || time_before(p->scx.dsq_vtime, min_vtime))) {
 		min_vtime     = p->scx.dsq_vtime;
 		min_vtime_dsq = cell_dsq;
 		found	      = true;
@@ -1405,6 +1621,17 @@ void BPF_STRUCT_OPS(mitosis_stopping, struct task_struct *p, bool runnable)
 	} else {
 		/* Advance cell and cpu dsq vtime to keep in sync with task vtime. */
 		advance_dsq_vtimes(cell, cctx, tctx, p->scx.dsq_vtime);
+	}
+
+	/* Advance subcell vtime if task has a subcell */
+	if (enable_subcells && tctx->subcell > 0) {
+		struct subcell *sc;
+		sc = bpf_map_lookup_elem(&subcells, &tctx->subcell);
+		if (sc) {
+			if (time_before(READ_ONCE(sc->vtime_now),
+					p->scx.dsq_vtime))
+				WRITE_ONCE(sc->vtime_now, p->scx.dsq_vtime);
+		}
 	}
 
 	{
@@ -2124,6 +2351,61 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(mitosis_init)
 		}
 	}
 
+	/* Create subcell DSQs and initialize subcell cpumasks */
+	if (enable_subcells) {
+		bpf_for(i, 0, MAX_TOTAL_SUBCELLS)
+		{
+			struct cell_cpumask_wrapper *sc_cpumaskw;
+
+			if (enable_llc_awareness) {
+				u32 llc;
+				bpf_for(llc, 0, nr_llc)
+				{
+					dsq_id_t dsq_id =
+						get_subcell_llc_dsq_id(i, llc);
+					if (dsq_is_invalid(dsq_id))
+						return -EINVAL;
+					ret = scx_bpf_create_dsq(dsq_id.raw,
+								 ANY_NUMA);
+					if (ret < 0)
+						return ret;
+				}
+			} else {
+				dsq_id_t dsq_id = get_subcell_llc_dsq_id(
+					i, FAKE_FLAT_CELL_LLC);
+				if (dsq_is_invalid(dsq_id))
+					return -EINVAL;
+				ret = scx_bpf_create_dsq(dsq_id.raw, ANY_NUMA);
+				if (ret < 0)
+					return ret;
+			}
+
+			if (!(sc_cpumaskw = bpf_map_lookup_elem(
+				      &subcell_cpumasks, &i)))
+				return -ENOENT;
+
+			/* Initialize subcell cpumask (empty, configured later) */
+			cpumask = bpf_cpumask_create();
+			if (!cpumask)
+				return -ENOMEM;
+			cpumask = bpf_kptr_xchg(&sc_cpumaskw->cpumask, cpumask);
+			if (cpumask) {
+				bpf_cpumask_release(cpumask);
+				return -EINVAL;
+			}
+
+			cpumask = bpf_cpumask_create();
+			if (!cpumask)
+				return -ENOMEM;
+			cpumask = bpf_kptr_xchg(&sc_cpumaskw->tmp_cpumask,
+						cpumask);
+			if (cpumask) {
+				bpf_cpumask_release(cpumask);
+				return -EINVAL;
+			}
+		}
+	}
+
 	if (enable_llc_awareness) {
 		{
 			guard(rcu)();
@@ -2356,6 +2638,111 @@ int apply_cell_config(void *ctx)
 					"borrowable tmp_cpumask should be null");
 				return -EINVAL;
 			}
+		}
+	}
+
+	/* Phase 2.5: Apply subcell configuration */
+	if (enable_subcells) {
+		struct subcell_config *sc_config = &subcell_config;
+
+		if (sc_config->num_subcells > MAX_TOTAL_SUBCELLS)
+			return -EINVAL;
+
+		/* Reset all subcells */
+		bpf_for(i, 0, MAX_TOTAL_SUBCELLS)
+		{
+			struct subcell *sc;
+			sc = bpf_map_lookup_elem(&subcells, &i);
+			if (sc) {
+				sc->in_use = 0;
+				sc->parent_cell = 0;
+			}
+		}
+
+		/* Apply subcell assignments and cpumasks */
+		bpf_for(i, 0, MAX_TOTAL_SUBCELLS)
+		{
+			struct subcell_assignment *sa;
+			struct subcell *sc;
+			struct cell_cpumask_wrapper *sc_cpumaskw;
+
+			if (i >= sc_config->num_subcells)
+				break;
+
+			sa = MEMBER_VPTR(sc_config->assignments, [i]);
+			if (!sa)
+				break;
+
+			u32 sc_id = sa->subcell_id;
+			if (sc_id >= MAX_TOTAL_SUBCELLS)
+				continue;
+
+			sc = bpf_map_lookup_elem(&subcells, &sc_id);
+			if (!sc)
+				continue;
+
+			sc->in_use = 1;
+			sc->parent_cell = sa->parent_cell;
+
+			/* Update parent cell's subcell tracking */
+			struct cell *parent = lookup_cell(sa->parent_cell);
+			if (parent) {
+				if (parent->num_subcells == 0)
+					parent->subcell_base_id = sc_id;
+				parent->num_subcells++;
+			}
+
+			/* Apply subcell cpumask */
+			sc_cpumaskw = bpf_map_lookup_elem(&subcell_cpumasks,
+							  &sc_id);
+			if (!sc_cpumaskw)
+				continue;
+
+			struct cell_cpumask_data *sc_mask_data;
+			sc_mask_data = MEMBER_VPTR(sc_config->cpumasks, [i]);
+			if (!sc_mask_data)
+				continue;
+
+			struct bpf_cpumask *sc_new __free(bpf_cpumask) =
+				bpf_kptr_xchg(&sc_cpumaskw->tmp_cpumask, NULL);
+			if (!sc_new)
+				continue;
+
+			bpf_cpumask_clear(sc_new);
+
+			u32 sc_cpu;
+			bpf_for(sc_cpu, 0, nr_possible_cpus)
+			{
+				u32		     byte_idx = sc_cpu / 8;
+				u32		     bit_idx  = sc_cpu % 8;
+				const unsigned char *bytep    = MEMBER_VPTR(
+					sc_mask_data->mask, [byte_idx]);
+				if (!bytep)
+					break;
+				if (*bytep & (1 << bit_idx)) {
+					bpf_cpumask_set_cpu(sc_cpu, sc_new);
+					/* Set CPU's subcell */
+					struct cpu_ctx *sc_cctx =
+						bpf_map_lookup_percpu_elem(
+							&cpu_ctxs,
+							&(u32){ 0 },
+							sc_cpu);
+					if (sc_cctx)
+						sc_cctx->subcell = sc_id;
+				}
+			}
+
+			/* Swap in new cpumask */
+			sc_new = bpf_kptr_xchg(&sc_cpumaskw->cpumask,
+					       no_free_ptr(sc_new));
+			if (!sc_new)
+				continue;
+
+			/* Put old as tmp */
+			struct bpf_cpumask *sc_stale __free(bpf_cpumask) =
+				bpf_kptr_xchg(&sc_cpumaskw->tmp_cpumask,
+					      no_free_ptr(sc_new));
+			/* sc_stale is freed by RAII if non-NULL */
 		}
 	}
 

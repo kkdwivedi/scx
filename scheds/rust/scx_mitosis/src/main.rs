@@ -5,8 +5,9 @@
 mod bpf_skel;
 pub use bpf_skel::*;
 pub mod bpf_intf;
-mod cell_manager;
+pub mod cell_manager;
 mod mitosis_topology_utils;
+mod profile;
 mod stats;
 
 use cell_manager::{CellManager, CpuAssignment};
@@ -146,6 +147,11 @@ struct Opts {
     #[clap(long)]
     cell_parent_cgroup: Option<String>,
 
+    /// JSON profile for cell and subcell configuration.
+    /// Mutually exclusive with --cell-parent-cgroup.
+    #[clap(long, conflicts_with = "cell_parent_cgroup")]
+    profile: Option<String>,
+
     /// Exact directory name of a direct child cgroup to exclude from cell creation
     /// (excluded cgroups remain in cell 0). Matched against the directory basename,
     /// not the full path. Can be specified multiple times. Requires --cell-parent-cgroup.
@@ -213,6 +219,8 @@ struct Scheduler<'a> {
     last_cpuset_seq: u32,
     /// Optional cell manager for --cell-parent-cgroup mode
     cell_manager: Option<CellManager>,
+    /// Optional profile manager for --profile mode
+    profile_manager: Option<profile::ProfileManager>,
     /// Whether CPU borrowing is enabled
     enable_borrowing: bool,
     /// Whether demand-based rebalancing is enabled
@@ -284,6 +292,9 @@ impl<'a> Scheduler<'a> {
         if opts.enable_work_stealing && !opts.enable_llc_awareness {
             bail!("Work stealing requires LLC-aware mode (--enable-llc-awareness)");
         }
+        if !opts.cell_exclude.is_empty() && opts.cell_parent_cgroup.is_none() {
+            bail!("--cell-exclude requires --cell-parent-cgroup");
+        }
 
         Ok(())
     }
@@ -333,9 +344,23 @@ impl<'a> Scheduler<'a> {
             .rodata_data
             .as_mut()
             .expect("rodata_data must be available during init")
-            .userspace_managed_cell_mode = opts.cell_parent_cgroup.is_some();
+            .userspace_managed_cell_mode =
+            opts.cell_parent_cgroup.is_some() || opts.profile.is_some();
 
         skel.maps.rodata_data.as_mut().unwrap().enable_borrowing = opts.enable_borrowing;
+
+        // Create ProfileManager early so we can set enable_subcells before load
+        let profile_manager = if let Some(ref profile_path) = opts.profile {
+            let pm = profile::ProfileManager::from_file(
+                profile_path,
+                topology.span.clone(),
+            )?;
+            // Set enable_subcells in rodata before load
+            skel.maps.rodata_data.as_mut().unwrap().enable_subcells = pm.has_subcells();
+            Some(pm)
+        } else {
+            None
+        };
 
         match *compat::SCX_OPS_ALLOW_QUEUED_WAKEUP {
             0 => info!("Kernel does not support queued wakeup optimization."),
@@ -354,14 +379,16 @@ impl<'a> Scheduler<'a> {
             None,
         )?;
 
-        let skel = scx_ops_load!(skel, mitosis, uei)?;
+        let mut skel = scx_ops_load!(skel, mitosis, uei)?;
+
+        // Populate subcell specs in BPF BSS after load but before attach
+        if let Some(ref pm) = profile_manager {
+            pm.populate_bpf_subcell_specs(&mut skel)?;
+        }
 
         let stats_server = StatsServer::new(stats::server_data()).launch()?;
 
         // Initialize CellManager if --cell-parent-cgroup is specified
-        if !opts.cell_exclude.is_empty() && opts.cell_parent_cgroup.is_none() {
-            bail!("--cell-exclude requires --cell-parent-cgroup");
-        }
         let cell_manager = if let Some(ref parent_cgroup) = opts.cell_parent_cgroup {
             let exclude: HashSet<String> = opts.cell_exclude.iter().cloned().collect();
             Some(CellManager::new(
@@ -410,6 +437,7 @@ impl<'a> Scheduler<'a> {
             last_configuration_seq: None,
             last_cpuset_seq: 0,
             cell_manager,
+            profile_manager,
             enable_borrowing: opts.enable_borrowing,
             enable_rebalancing: opts.enable_rebalancing,
             rebalance_threshold: opts.rebalance_threshold,
@@ -495,6 +523,9 @@ impl<'a> Scheduler<'a> {
 
     /// Apply initial cell assignments discovered at startup
     fn apply_initial_cells(&mut self) -> Result<()> {
+        if self.profile_manager.is_some() {
+            return self.apply_initial_profile_cells();
+        }
         if self.cell_manager.is_none() {
             return Ok(());
         }
@@ -506,6 +537,29 @@ impl<'a> Scheduler<'a> {
             "Applied initial cell configuration: {}",
             cell_manager.format_cell_config(&cpu_assignments)
         );
+
+        Ok(())
+    }
+
+    /// Apply initial cell configuration from profile.
+    fn apply_initial_profile_cells(&mut self) -> Result<()> {
+        let pm = self.profile_manager.as_mut().unwrap();
+        let enable_borrowing = self.enable_borrowing;
+        let cpu_assignments = pm.compute_cpu_assignments(enable_borrowing)?;
+
+        // Compute subcell CPU assignments
+        pm.compute_subcell_cpu_assignments(&cpu_assignments)?;
+
+        let cell_assignments = pm.get_cell_assignments();
+        let config_str = pm.format_config(&cpu_assignments);
+
+        // Build and write subcell config
+        pm.build_subcell_config(&mut self.skel)?;
+
+        // Apply cell config (this also applies subcell config via BPF)
+        self.apply_cell_config(&cell_assignments, &cpu_assignments)?;
+
+        info!("Applied initial profile configuration: {}", config_str);
 
         Ok(())
     }
@@ -944,7 +998,7 @@ impl<'a> Scheduler<'a> {
 
         self.log_all_queue_stats(&cell_stats_delta)?;
 
-        if self.cell_manager.is_some() {
+        if self.cell_manager.is_some() || self.profile_manager.is_some() {
             self.collect_demand_metrics(&cpu_ctxs)?;
         }
 
@@ -1195,7 +1249,7 @@ impl<'a> Scheduler<'a> {
     }
 }
 
-fn write_cpumask_to_config(cpumask: &Cpumask, dest: &mut [u8]) {
+pub fn write_cpumask_to_config(cpumask: &Cpumask, dest: &mut [u8]) {
     let raw_slice = cpumask.as_raw_slice();
     for (word_idx, word) in raw_slice.iter().enumerate() {
         let byte_start = word_idx * 8;

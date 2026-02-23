@@ -90,6 +90,14 @@ fn compute_targets(total_cpus: usize, cells: &[(u32, f64)]) -> Result<HashMap<u3
         .collect())
 }
 
+/// Public wrapper for compute_targets, used by profile.rs.
+pub fn compute_targets_pub(
+    total_cpus: usize,
+    cells: &[(u32, f64)],
+) -> Result<HashMap<u32, usize>> {
+    compute_targets(total_cpus, cells)
+}
+
 /// Distribute CPUs among recipients proportionally by weight, without a floor guarantee.
 ///
 /// Unlike `distribute_cpus_by_weight`, recipients with weight 0 (or very low weight)
