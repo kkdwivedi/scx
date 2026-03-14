@@ -644,8 +644,8 @@ fn parse_perf_mem_script_line(line: &str) -> Option<PerfMemRecord> {
     let comm = parts[..tid_pid_idx].join(" ");
 
     let tid_pid: Vec<&str> = parts[tid_pid_idx].split('/').collect();
-    let tid = tid_pid[0].parse::<u32>().ok()?;
-    let pid = tid_pid[1].parse::<u32>().ok()?;
+    let pid = tid_pid[0].parse::<u32>().ok()?;
+    let tid = tid_pid[1].parse::<u32>().ok()?;
 
     let remaining = &parts[tid_pid_idx + 1..];
 
