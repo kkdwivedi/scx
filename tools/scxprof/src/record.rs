@@ -44,6 +44,13 @@ const SCHED_TRACE_EVENTS: &[&str] = &[
     "nmi:nmi_handler",
 ];
 
+pub const PERF_MEM_DATA_FILE: &str = "perf.mem.data";
+pub const PERF_MEM_SCRIPT_FILE: &str = "perf.mem.script";
+pub const PERF_MEM_JSONL_FILE: &str = "perf.mem.jsonl";
+pub const PERF_SCHED_DATA_FILE: &str = "perf.sched.data";
+pub const PERF_SCHED_SCRIPT_FILE: &str = "perf.sched.script";
+pub const PERF_SCHED_JSONL_FILE: &str = "perf.sched.jsonl";
+
 #[derive(Debug, Parser)]
 pub struct RecordOpts {
     /// Output directory for recording
@@ -70,7 +77,7 @@ pub struct RecordOpts {
     #[clap(long)]
     pub disable_archive: bool,
 
-    /// Generate perf.script file during recording
+    /// Generate perf.mem.script and perf.sched.script during recording
     #[clap(long)]
     pub enable_perf_script: bool,
 
@@ -369,22 +376,22 @@ pub fn cmd_record(ctx: &Context, opts: RecordOpts) -> Result<()> {
     }
 
     if opts.enable_perf_script {
-        println!("Generating perf.script...");
+        println!("Generating perf.mem.script...");
         if let Err(e) = generate_perf_script(
             ctx,
-            &opts.output.join("perf.data"),
-            &opts.output.join("perf.script"),
-            PERF_SCRIPT_FIELDS,
+            &opts.output.join(PERF_MEM_DATA_FILE),
+            &opts.output.join(PERF_MEM_SCRIPT_FILE),
+            PERF_MEM_SCRIPT_FIELDS,
         ) {
-            eprintln!("warning: failed to generate perf.script: {}", e);
+            eprintln!("warning: failed to generate perf.mem.script: {}", e);
         }
 
-        if !opts.disable_sched_trace && opts.output.join("perf.sched.data").exists() {
+        if !opts.disable_sched_trace && opts.output.join(PERF_SCHED_DATA_FILE).exists() {
             println!("Generating perf.sched.script...");
             if let Err(e) = generate_perf_script(
                 ctx,
-                &opts.output.join("perf.sched.data"),
-                &opts.output.join("perf.sched.script"),
+                &opts.output.join(PERF_SCHED_DATA_FILE),
+                &opts.output.join(PERF_SCHED_SCRIPT_FILE),
                 PERF_SCHED_SCRIPT_FIELDS,
             ) {
                 eprintln!("warning: failed to generate perf.sched.script: {}", e);
@@ -401,7 +408,7 @@ pub fn cmd_record(ctx: &Context, opts: RecordOpts) -> Result<()> {
 }
 
 fn run_recording(ctx: &Context, opts: &RecordOpts) -> Result<bool> {
-    let perf_data_path = opts.output.join("perf.data");
+    let perf_data_path = opts.output.join(PERF_MEM_DATA_FILE);
     let mem_perf_args = vec![
         perf_binary(),
         "mem".to_string(),
@@ -418,7 +425,7 @@ fn run_recording(ctx: &Context, opts: &RecordOpts) -> Result<bool> {
     let mut processes = vec![SpawnedProcess::spawn(&mem_perf_args)?];
 
     if !opts.disable_sched_trace {
-        let sched_data_path = opts.output.join("perf.sched.data");
+        let sched_data_path = opts.output.join(PERF_SCHED_DATA_FILE);
         let mut sched_perf_args = vec![
             perf_binary(),
             "record".to_string(),
@@ -548,8 +555,8 @@ fn create_archive(output_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Fields to extract from perf script output
-pub const PERF_SCRIPT_FIELDS: &str =
+/// Fields to extract from perf mem script output
+pub const PERF_MEM_SCRIPT_FIELDS: &str =
     "comm,tid,pid,time,cgroup,ip,addr,phys_addr,data_page_size,dso,sym";
 
 /// Fields to extract from sched trace perf script output
@@ -565,7 +572,8 @@ fn generate_perf_script(
         bail!("perf data file '{}' not found", perf_data_path.display());
     }
 
-    let output_file = File::create(&perf_script_path).context("failed to create perf.script")?;
+    let output_file = File::create(&perf_script_path)
+        .with_context(|| format!("failed to create {}", perf_script_path.display()))?;
 
     let child = Command::new(perf_binary())
         .args([

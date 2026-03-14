@@ -3,7 +3,11 @@
 // This software may be used and distributed according to the terms of the
 // GNU General Public License version 2.
 
-use crate::record::{perf_binary, PERF_SCHED_SCRIPT_FIELDS, PERF_SCRIPT_FIELDS};
+use crate::record::{
+    perf_binary, PERF_MEM_DATA_FILE, PERF_MEM_JSONL_FILE, PERF_MEM_SCRIPT_FIELDS,
+    PERF_MEM_SCRIPT_FILE, PERF_SCHED_DATA_FILE, PERF_SCHED_JSONL_FILE, PERF_SCHED_SCRIPT_FIELDS,
+    PERF_SCHED_SCRIPT_FILE,
+};
 use anyhow::{bail, Context as _, Result};
 use clap::Parser;
 use regex::Regex;
@@ -27,9 +31,9 @@ pub struct ProcessOpts {
     pub verbose: bool,
 }
 
-/// Represents a single perf script sample record
+/// Represents a single perf mem sample record
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PerfScriptRecord {
+pub struct PerfMemRecord {
     pub comm: String,
     pub tid: u32,
     pub pid: u32,
@@ -47,7 +51,7 @@ pub struct PerfScriptRecord {
     sample_time_ns: Option<u64>,
 }
 
-/// Represents a single sched trace record from perf script
+/// Represents a single sched trace record from perf sched script
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PerfSchedScriptRecord {
     pub comm: String,
@@ -85,6 +89,16 @@ struct OrderingIssues {
     violations: u64,
     affected_tids: HashSet<u32>,
     example_tids: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TraceArtifacts<'a> {
+    data_file: &'a str,
+    script_file: &'a str,
+    jsonl_file: &'a str,
+    script_fields: &'a str,
+    script_kind: &'a str,
+    jsonl_kind: &'a str,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -213,7 +227,7 @@ impl ThreadHintTimeline {
     }
 }
 
-impl HintAssignable for PerfScriptRecord {
+impl HintAssignable for PerfMemRecord {
     fn hint_tid(&self) -> Option<u32> {
         Some(self.tid)
     }
@@ -305,6 +319,22 @@ pub fn cmd_process(opts: ProcessOpts) -> Result<()> {
 }
 
 fn run_processing(profile_dir: &Path, output_dir: &Path, verbose: bool) -> Result<()> {
+    let mem_trace = TraceArtifacts {
+        data_file: PERF_MEM_DATA_FILE,
+        script_file: PERF_MEM_SCRIPT_FILE,
+        jsonl_file: PERF_MEM_JSONL_FILE,
+        script_fields: PERF_MEM_SCRIPT_FIELDS,
+        script_kind: "perf.mem.script",
+        jsonl_kind: "perf.mem.jsonl",
+    };
+    let sched_trace = TraceArtifacts {
+        data_file: PERF_SCHED_DATA_FILE,
+        script_file: PERF_SCHED_SCRIPT_FILE,
+        jsonl_file: PERF_SCHED_JSONL_FILE,
+        script_fields: PERF_SCHED_SCRIPT_FIELDS,
+        script_kind: "perf.sched.script",
+        jsonl_kind: "perf.sched.jsonl",
+    };
     let hint_index = HintIndex::load_if_exists(profile_dir)?;
     if let Some(hint_index) = hint_index.as_ref() {
         if let Some(ordering_issues) = hint_index.ordering_issues.as_ref() {
@@ -314,59 +344,54 @@ fn run_processing(profile_dir: &Path, output_dir: &Path, verbose: bool) -> Resul
             );
         }
     }
-    let perf_script_src = profile_dir.join("perf.script");
-    let perf_script_dst = output_dir.join("perf.script");
-    let perf_jsonl_dst = output_dir.join("perf.jsonl");
-    let sched_perf_data_src = profile_dir.join("perf.sched.data");
-    let sched_perf_script_src = profile_dir.join("perf.sched.script");
-    let sched_perf_script_dst = output_dir.join("perf.sched.script");
-    let sched_perf_jsonl_dst = output_dir.join("perf.sched.jsonl");
-
-    if !perf_script_src.exists() {
-        println!("Generating perf.script from perf.data...");
-        generate_perf_script(
-            &profile_dir.join("perf.data"),
-            &perf_script_src,
-            PERF_SCRIPT_FIELDS,
-        )?;
-    }
-
-    println!("Copying perf.script...");
-    fs::copy(&perf_script_src, &perf_script_dst).context("failed to copy perf.script")?;
-
-    println!("Parsing perf.script to generate perf.jsonl...");
-    parse_perf_script_to_jsonl(
-        &perf_script_dst,
-        &perf_jsonl_dst,
+    let mem_perf_script_dst = prepare_trace_script(profile_dir, output_dir, mem_trace)?;
+    parse_perf_mem_script_to_jsonl(
+        &mem_perf_script_dst,
+        &output_dir.join(mem_trace.jsonl_file),
         hint_index.as_ref(),
+        mem_trace,
         verbose,
     )?;
 
-    if sched_perf_script_src.exists() || sched_perf_data_src.exists() {
-        if !sched_perf_script_src.exists() {
-            println!("Generating perf.sched.script from perf.sched.data...");
-            generate_perf_script(
-                &sched_perf_data_src,
-                &sched_perf_script_src,
-                PERF_SCHED_SCRIPT_FIELDS,
-            )?;
-        }
-
-        println!("Copying perf.sched.script...");
-        fs::copy(&sched_perf_script_src, &sched_perf_script_dst)
-            .context("failed to copy perf.sched.script")?;
-
-        println!("Parsing perf.sched.script to generate perf.sched.jsonl...");
+    if profile_dir.join(sched_trace.script_file).exists()
+        || profile_dir.join(sched_trace.data_file).exists()
+    {
+        let sched_perf_script_dst = prepare_trace_script(profile_dir, output_dir, sched_trace)?;
         parse_sched_perf_script_to_jsonl(
             &sched_perf_script_dst,
-            &sched_perf_jsonl_dst,
+            &output_dir.join(sched_trace.jsonl_file),
             hint_index.as_ref(),
+            sched_trace,
             verbose,
         )?;
     }
 
     print_profile_contents(output_dir)?;
     Ok(())
+}
+
+fn prepare_trace_script(
+    profile_dir: &Path,
+    output_dir: &Path,
+    artifacts: TraceArtifacts<'_>,
+) -> Result<PathBuf> {
+    let perf_data_src = profile_dir.join(artifacts.data_file);
+    let perf_script_src = profile_dir.join(artifacts.script_file);
+    let perf_script_dst = output_dir.join(artifacts.script_file);
+
+    if !perf_script_src.exists() {
+        println!(
+            "Generating {} from {}...",
+            artifacts.script_kind, artifacts.data_file
+        );
+        generate_perf_script(&perf_data_src, &perf_script_src, artifacts.script_fields)?;
+    }
+
+    println!("Copying {}...", artifacts.script_kind);
+    fs::copy(&perf_script_src, &perf_script_dst)
+        .with_context(|| format!("failed to copy {}", artifacts.script_kind))?;
+
+    Ok(perf_script_dst)
 }
 
 fn prepare_profile_dir(path: &Path) -> Result<PathBuf> {
@@ -442,7 +467,8 @@ fn generate_perf_script(
         bail!("perf script failed: {}", stderr);
     }
 
-    fs::write(&perf_script_path, &output.stdout).context("failed to write perf.script")?;
+    fs::write(&perf_script_path, &output.stdout)
+        .with_context(|| format!("failed to write {}", perf_script_path.display()))?;
 
     Ok(())
 }
@@ -529,7 +555,7 @@ fn perf_time_f64_to_ns(time: f64) -> Option<u64> {
     Some(ns as u64)
 }
 
-fn parse_perf_script_line(line: &str) -> Option<PerfScriptRecord> {
+fn parse_perf_mem_script_line(line: &str) -> Option<PerfMemRecord> {
     let line = line.trim();
     if line.is_empty() {
         return None;
@@ -592,7 +618,7 @@ fn parse_perf_script_line(line: &str) -> Option<PerfScriptRecord> {
         (String::new(), String::new(), String::new(), 0)
     };
 
-    Some(PerfScriptRecord {
+    Some(PerfMemRecord {
         comm,
         tid,
         pid,
@@ -717,16 +743,19 @@ fn parse_sched_perf_script_line(line: &str) -> Option<PerfSchedScriptRecord> {
     })
 }
 
-fn parse_perf_script_to_jsonl(
+fn parse_perf_mem_script_to_jsonl(
     perf_script_path: &Path,
     output_path: &Path,
     hint_index: Option<&HintIndex>,
+    artifacts: TraceArtifacts<'_>,
     verbose: bool,
 ) -> Result<()> {
-    let file = File::open(perf_script_path).context("failed to open perf.script")?;
+    let file = File::open(perf_script_path)
+        .with_context(|| format!("failed to open {}", artifacts.script_kind))?;
     let reader = BufReader::new(file);
 
-    let output_file = File::create(output_path).context("failed to create perf.jsonl")?;
+    let output_file = File::create(output_path)
+        .with_context(|| format!("failed to create {}", artifacts.jsonl_kind))?;
     let mut writer = BufWriter::new(output_file);
 
     let mut count = 0;
@@ -736,7 +765,7 @@ fn parse_perf_script_to_jsonl(
 
     for line in reader.lines() {
         let line = line.context("failed to read line")?;
-        match parse_perf_script_line(&line) {
+        match parse_perf_mem_script_line(&line) {
             Some(mut record) => {
                 if record.phys_addr == "0" || record.phys_addr.is_empty() {
                     skipped += 1;
@@ -792,12 +821,15 @@ fn parse_sched_perf_script_to_jsonl(
     perf_script_path: &Path,
     output_path: &Path,
     hint_index: Option<&HintIndex>,
+    artifacts: TraceArtifacts<'_>,
     verbose: bool,
 ) -> Result<()> {
-    let file = File::open(perf_script_path).context("failed to open perf.sched.script")?;
+    let file = File::open(perf_script_path)
+        .with_context(|| format!("failed to open {}", artifacts.script_kind))?;
     let reader = BufReader::new(file);
 
-    let output_file = File::create(output_path).context("failed to create perf.sched.jsonl")?;
+    let output_file = File::create(output_path)
+        .with_context(|| format!("failed to create {}", artifacts.jsonl_kind))?;
     let mut writer = BufWriter::new(output_file);
 
     let mut count = 0;

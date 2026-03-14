@@ -3,7 +3,7 @@
 // This software may be used and distributed according to the terms of the
 // GNU General Public License version 2.
 
-use crate::process::PerfScriptRecord;
+use crate::process::PerfMemRecord;
 use anyhow::{Context as _, Result};
 use clap::{ArgAction, Parser};
 use regex::Regex;
@@ -18,7 +18,7 @@ const DEFAULT_WORKLOAD_ALLOTMENT_CGROUP_REGEX: &str = r"workload-tw-[^/]+\.allot
 
 #[derive(Debug, Parser)]
 pub struct ExtractOpts {
-    /// Path to perf.jsonl file
+    /// Path to perf.mem.jsonl file
     #[clap(short = 'f', long)]
     pub file: PathBuf,
 
@@ -49,7 +49,7 @@ fn classify_cgroup<'a>(cgroup: &'a str, workload_cgroup: &'a str, allotment_re: 
 
 /// Samples belonging to a group, in time order
 struct GroupData {
-    samples: Vec<PerfScriptRecord>,
+    samples: Vec<PerfMemRecord>,
 }
 
 impl GroupData {
@@ -59,11 +59,11 @@ impl GroupData {
         }
     }
 
-    fn push(&mut self, sample: PerfScriptRecord) {
+    fn push(&mut self, sample: PerfMemRecord) {
         self.samples.push(sample);
     }
 
-    fn samples(&self) -> &[PerfScriptRecord] {
+    fn samples(&self) -> &[PerfMemRecord] {
         &self.samples
     }
 
@@ -117,7 +117,7 @@ enum GroupType {
 /// where clustering is not yet implemented.
 fn compute_clusters(
     group_type: GroupType,
-    samples: &[&PerfScriptRecord],
+    samples: &[&PerfMemRecord],
     threshold_pct: f64,
 ) -> ClusterResult {
     // TODO(kkd): Enable clustering for Workload and Rest
@@ -200,7 +200,7 @@ struct CellConfig {
 }
 
 pub fn cmd_extract(opts: ExtractOpts) -> Result<()> {
-    let file = File::open(&opts.file).context("failed to open perf.jsonl")?;
+    let file = File::open(&opts.file).context("failed to open perf.mem.jsonl")?;
     let reader = BufReader::new(file);
 
     let allotment_re =
@@ -212,7 +212,7 @@ pub fn cmd_extract(opts: ExtractOpts) -> Result<()> {
 
     for line in reader.lines() {
         let line = line.context("failed to read line")?;
-        let record: PerfScriptRecord =
+        let record: PerfMemRecord =
             serde_json::from_str(&line).context("failed to parse record")?;
 
         let group = classify_cgroup(&record.cgroup, workload_cgroup, &allotment_re);
@@ -275,7 +275,7 @@ fn generate_config(
 
     for (group_type, name) in group_types {
         // Collect samples for this group type
-        let samples: Vec<&PerfScriptRecord> = match group_type {
+        let samples: Vec<&PerfMemRecord> = match group_type {
             GroupType::Allotment => group_names
                 .iter()
                 .filter(|n| *n != "rest" && *n != workload_cgroup)
