@@ -9,6 +9,7 @@ use clap::Parser;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value};
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -40,6 +41,10 @@ pub struct PerfScriptRecord {
     pub dso: String,
     pub phys_addr: String,
     pub data_page_size: u64,
+    #[serde(default)]
+    pub hint: u64,
+    #[serde(skip, default)]
+    sample_time_ns: Option<u64>,
 }
 
 /// Represents a single sched trace record from perf script
@@ -54,6 +59,158 @@ pub struct PerfSchedScriptRecord {
     pub trace: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fields: Option<Map<String, Value>>,
+    #[serde(default)]
+    pub hint: u64,
+    #[serde(skip, default)]
+    sample_time_ns: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct HintRecord {
+    pid: i32,
+    #[allow(dead_code)]
+    tgid: i32,
+    hints: u64,
+    timestamp: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ThreadHintTimeline {
+    records: Vec<HintRecord>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct HintIndex {
+    timelines: HashMap<u32, ThreadHintTimeline>,
+}
+
+#[derive(Debug)]
+struct HintAnnotator<'a> {
+    hint_index: &'a HintIndex,
+    cursors: HashMap<u32, usize>,
+}
+
+trait HintAssignable {
+    fn hint_tid(&self) -> Option<u32>;
+    fn hint_time_ns(&self) -> Option<u64>;
+    fn set_hint(&mut self, hint: u64);
+}
+
+impl HintIndex {
+    fn load_if_exists(profile_dir: &Path) -> Result<Option<Self>> {
+        let hints_path = profile_dir.join("hints.jsonl");
+        if !hints_path.exists() {
+            return Ok(None);
+        }
+
+        let file = File::open(&hints_path).context("failed to open hints.jsonl")?;
+        let reader = BufReader::new(file);
+        let mut timelines: HashMap<u32, Vec<HintRecord>> = HashMap::new();
+
+        for line in reader.lines() {
+            let line = line.context("failed to read hints.jsonl line")?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let record: HintRecord =
+                serde_json::from_str(&line).context("failed to parse hints.jsonl record")?;
+            if let Ok(pid) = u32::try_from(record.pid) {
+                timelines.entry(pid).or_default().push(record);
+            }
+        }
+
+        let timelines = timelines
+            .into_iter()
+            .map(|(tid, mut records)| {
+                records.sort_by_key(|record| record.timestamp);
+                (tid, ThreadHintTimeline { records })
+            })
+            .collect();
+
+        Ok(Some(Self { timelines }))
+    }
+}
+
+impl<'a> HintAnnotator<'a> {
+    fn new(hint_index: &'a HintIndex) -> Self {
+        Self {
+            hint_index,
+            cursors: HashMap::new(),
+        }
+    }
+
+    fn annotate<R: HintAssignable>(&mut self, record: &mut R) {
+        let hint = record
+            .hint_tid()
+            .zip(record.hint_time_ns())
+            .and_then(|(tid, time_ns)| self.resolve_hint(tid, time_ns))
+            .unwrap_or(0);
+        record.set_hint(hint);
+    }
+
+    fn resolve_hint(&mut self, tid: u32, time_ns: u64) -> Option<u64> {
+        let timeline = self.hint_index.timelines.get(&tid)?;
+        let cursor = self.cursors.entry(tid).or_insert(0);
+        timeline.resolve_hint(time_ns, cursor)
+    }
+}
+
+impl ThreadHintTimeline {
+    fn resolve_hint(&self, time_ns: u64, cursor: &mut usize) -> Option<u64> {
+        if self.records.is_empty() {
+            return None;
+        }
+
+        if *cursor >= self.records.len() {
+            *cursor = self.records.len() - 1;
+        }
+
+        if self.records[*cursor].timestamp > time_ns {
+            let idx = self
+                .records
+                .partition_point(|record| record.timestamp <= time_ns);
+            if idx == 0 {
+                *cursor = 0;
+                return None;
+            }
+            *cursor = idx - 1;
+            return Some(self.records[*cursor].hints);
+        }
+
+        while *cursor + 1 < self.records.len() && self.records[*cursor + 1].timestamp <= time_ns {
+            *cursor += 1;
+        }
+
+        Some(self.records[*cursor].hints)
+    }
+}
+
+impl HintAssignable for PerfScriptRecord {
+    fn hint_tid(&self) -> Option<u32> {
+        Some(self.tid)
+    }
+
+    fn hint_time_ns(&self) -> Option<u64> {
+        self.sample_time_ns
+    }
+
+    fn set_hint(&mut self, hint: u64) {
+        self.hint = hint;
+    }
+}
+
+impl HintAssignable for PerfSchedScriptRecord {
+    fn hint_tid(&self) -> Option<u32> {
+        u32::try_from(self.tid).ok()
+    }
+
+    fn hint_time_ns(&self) -> Option<u64> {
+        self.sample_time_ns
+    }
+
+    fn set_hint(&mut self, hint: u64) {
+        self.hint = hint;
+    }
 }
 
 pub fn cmd_process(opts: ProcessOpts) -> Result<()> {
@@ -72,6 +229,7 @@ pub fn cmd_process(opts: ProcessOpts) -> Result<()> {
 }
 
 fn run_processing(profile_dir: &Path, output_dir: &Path, verbose: bool) -> Result<()> {
+    let hint_index = HintIndex::load_if_exists(profile_dir)?;
     let perf_script_src = profile_dir.join("perf.script");
     let perf_script_dst = output_dir.join("perf.script");
     let perf_jsonl_dst = output_dir.join("perf.jsonl");
@@ -93,7 +251,12 @@ fn run_processing(profile_dir: &Path, output_dir: &Path, verbose: bool) -> Resul
     fs::copy(&perf_script_src, &perf_script_dst).context("failed to copy perf.script")?;
 
     println!("Parsing perf.script to generate perf.jsonl...");
-    parse_perf_script_to_jsonl(&perf_script_dst, &perf_jsonl_dst, verbose)?;
+    parse_perf_script_to_jsonl(
+        &perf_script_dst,
+        &perf_jsonl_dst,
+        hint_index.as_ref(),
+        verbose,
+    )?;
 
     if sched_perf_script_src.exists() || sched_perf_data_src.exists() {
         if !sched_perf_script_src.exists() {
@@ -110,7 +273,12 @@ fn run_processing(profile_dir: &Path, output_dir: &Path, verbose: bool) -> Resul
             .context("failed to copy perf.sched.script")?;
 
         println!("Parsing perf.sched.script to generate perf.sched.jsonl...");
-        parse_sched_perf_script_to_jsonl(&sched_perf_script_dst, &sched_perf_jsonl_dst, verbose)?;
+        parse_sched_perf_script_to_jsonl(
+            &sched_perf_script_dst,
+            &sched_perf_jsonl_dst,
+            hint_index.as_ref(),
+            verbose,
+        )?;
     }
 
     print_profile_contents(output_dir)?;
@@ -242,6 +410,41 @@ fn parse_page_size(s: &str) -> u64 {
     }
 }
 
+fn parse_perf_time_ns(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+
+    let (secs_str, frac_str) = match s.split_once('.') {
+        Some((secs, frac)) => (secs, frac),
+        None => (s, ""),
+    };
+
+    let secs = secs_str.parse::<u64>().ok()?;
+    let mut frac_ns = 0u64;
+    let mut scale = 100_000_000u64;
+
+    for ch in frac_str.chars().take(9) {
+        let digit = ch.to_digit(10)? as u64;
+        frac_ns += digit * scale;
+        scale /= 10;
+    }
+
+    secs.checked_mul(1_000_000_000)?.checked_add(frac_ns)
+}
+
+fn perf_time_f64_to_ns(time: f64) -> Option<u64> {
+    if !time.is_finite() || time < 0.0 {
+        return None;
+    }
+    let ns = time * 1_000_000_000.0;
+    if ns < 0.0 || ns > u64::MAX as f64 {
+        return None;
+    }
+    Some(ns as u64)
+}
+
 fn parse_perf_script_line(line: &str) -> Option<PerfScriptRecord> {
     let line = line.trim();
     if line.is_empty() {
@@ -282,6 +485,7 @@ fn parse_perf_script_line(line: &str) -> Option<PerfScriptRecord> {
     }
 
     let time = remaining[0].trim_end_matches(':').to_string();
+    let sample_time_ns = parse_perf_time_ns(&time);
     let addr = remaining[1].to_string();
     let cgroup = remaining[2].to_string();
     let ip = remaining[3].to_string();
@@ -316,6 +520,8 @@ fn parse_perf_script_line(line: &str) -> Option<PerfScriptRecord> {
         dso,
         phys_addr,
         data_page_size,
+        hint: 0,
+        sample_time_ns,
     })
 }
 
@@ -408,6 +614,7 @@ fn parse_sched_perf_script_line(line: &str) -> Option<PerfSchedScriptRecord> {
     let tid = captures.name("tid")?.as_str().parse::<i32>().ok()?;
     let cpu = captures.name("cpu")?.as_str().parse::<u32>().ok()?;
     let time = captures.name("time")?.as_str().parse::<f64>().ok()?;
+    let sample_time_ns = perf_time_f64_to_ns(time);
     let event = captures.name("event")?.as_str().trim().to_string();
     let trace = captures.name("trace")?.as_str().trim().to_string();
     let fields = parse_sched_fields(&event, &trace);
@@ -421,12 +628,15 @@ fn parse_sched_perf_script_line(line: &str) -> Option<PerfSchedScriptRecord> {
         event,
         trace,
         fields,
+        hint: 0,
+        sample_time_ns,
     })
 }
 
 fn parse_perf_script_to_jsonl(
     perf_script_path: &Path,
     output_path: &Path,
+    hint_index: Option<&HintIndex>,
     verbose: bool,
 ) -> Result<()> {
     let file = File::open(perf_script_path).context("failed to open perf.script")?;
@@ -438,11 +648,12 @@ fn parse_perf_script_to_jsonl(
     let mut count = 0;
     let mut skipped = 0;
     let mut errors = 0;
+    let mut hint_annotator = hint_index.map(HintAnnotator::new);
 
     for line in reader.lines() {
         let line = line.context("failed to read line")?;
         match parse_perf_script_line(&line) {
-            Some(record) => {
+            Some(mut record) => {
                 if record.phys_addr == "0" || record.phys_addr.is_empty() {
                     skipped += 1;
                     if verbose {
@@ -456,6 +667,9 @@ fn parse_perf_script_to_jsonl(
                         eprintln!("skipped (filtered comm): {}", line);
                     }
                     continue;
+                }
+                if let Some(hint_annotator) = hint_annotator.as_mut() {
+                    hint_annotator.annotate(&mut record);
                 }
                 let json = serde_json::to_string(&record).context("failed to serialize record")?;
                 writeln!(writer, "{}", json)?;
@@ -486,6 +700,7 @@ fn parse_perf_script_to_jsonl(
 fn parse_sched_perf_script_to_jsonl(
     perf_script_path: &Path,
     output_path: &Path,
+    hint_index: Option<&HintIndex>,
     verbose: bool,
 ) -> Result<()> {
     let file = File::open(perf_script_path).context("failed to open perf.sched.script")?;
@@ -496,11 +711,15 @@ fn parse_sched_perf_script_to_jsonl(
 
     let mut count = 0;
     let mut errors = 0;
+    let mut hint_annotator = hint_index.map(HintAnnotator::new);
 
     for line in reader.lines() {
         let line = line.context("failed to read line")?;
         match parse_sched_perf_script_line(&line) {
-            Some(record) => {
+            Some(mut record) => {
+                if let Some(hint_annotator) = hint_annotator.as_mut() {
+                    hint_annotator.annotate(&mut record);
+                }
                 let json = serde_json::to_string(&record).context("failed to serialize record")?;
                 writeln!(writer, "{}", json)?;
                 count += 1;
