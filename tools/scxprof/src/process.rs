@@ -9,7 +9,7 @@ use clap::Parser;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -79,15 +79,26 @@ struct ThreadHintTimeline {
     records: Vec<HintRecord>,
 }
 
+#[derive(Debug, Clone)]
+struct OrderingIssues {
+    label: &'static str,
+    violations: u64,
+    affected_tids: HashSet<u32>,
+    example_tids: Vec<u32>,
+}
+
 #[derive(Debug, Clone, Default)]
 struct HintIndex {
     timelines: HashMap<u32, ThreadHintTimeline>,
+    ordering_issues: Option<OrderingIssues>,
 }
 
 #[derive(Debug)]
 struct HintAnnotator<'a> {
     hint_index: &'a HintIndex,
     cursors: HashMap<u32, usize>,
+    last_sample_time_ns: HashMap<u32, u64>,
+    ordering_issues: OrderingIssues,
 }
 
 trait HintAssignable {
@@ -106,6 +117,8 @@ impl HintIndex {
         let file = File::open(&hints_path).context("failed to open hints.jsonl")?;
         let reader = BufReader::new(file);
         let mut timelines: HashMap<u32, Vec<HintRecord>> = HashMap::new();
+        let mut last_timestamp_by_tid: HashMap<u32, u64> = HashMap::new();
+        let mut ordering_issues = OrderingIssues::new("hint timeline");
 
         for line in reader.lines() {
             let line = line.context("failed to read hints.jsonl line")?;
@@ -115,6 +128,9 @@ impl HintIndex {
             let record: HintRecord =
                 serde_json::from_str(&line).context("failed to parse hints.jsonl record")?;
             if let Ok(pid) = u32::try_from(record.pid) {
+                if let Some(last_timestamp) = last_timestamp_by_tid.insert(pid, record.timestamp) {
+                    ordering_issues.observe(pid, last_timestamp, record.timestamp);
+                }
                 timelines.entry(pid).or_default().push(record);
             }
         }
@@ -127,7 +143,10 @@ impl HintIndex {
             })
             .collect();
 
-        Ok(Some(Self { timelines }))
+        Ok(Some(Self {
+            timelines,
+            ordering_issues: ordering_issues.into_option(),
+        }))
     }
 }
 
@@ -136,6 +155,8 @@ impl<'a> HintAnnotator<'a> {
         Self {
             hint_index,
             cursors: HashMap::new(),
+            last_sample_time_ns: HashMap::new(),
+            ordering_issues: OrderingIssues::new("sample timeline"),
         }
     }
 
@@ -149,9 +170,16 @@ impl<'a> HintAnnotator<'a> {
     }
 
     fn resolve_hint(&mut self, tid: u32, time_ns: u64) -> Option<u64> {
+        if let Some(last_time_ns) = self.last_sample_time_ns.insert(tid, time_ns) {
+            self.ordering_issues.observe(tid, last_time_ns, time_ns);
+        }
         let timeline = self.hint_index.timelines.get(&tid)?;
         let cursor = self.cursors.entry(tid).or_insert(0);
         timeline.resolve_hint(time_ns, cursor)
+    }
+
+    fn finish(self) -> Option<OrderingIssues> {
+        self.ordering_issues.into_option()
     }
 }
 
@@ -213,6 +241,54 @@ impl HintAssignable for PerfSchedScriptRecord {
     }
 }
 
+impl OrderingIssues {
+    fn new(label: &'static str) -> Self {
+        Self {
+            label,
+            violations: 0,
+            affected_tids: HashSet::new(),
+            example_tids: Vec::new(),
+        }
+    }
+
+    fn observe(&mut self, tid: u32, last_timestamp: u64, current_timestamp: u64) {
+        if current_timestamp < last_timestamp {
+            self.violations += 1;
+            if self.affected_tids.insert(tid) && self.example_tids.len() < 8 {
+                self.example_tids.push(tid);
+            }
+        }
+    }
+
+    fn into_option(self) -> Option<Self> {
+        (self.violations > 0).then_some(self)
+    }
+
+    fn warn(&self, context: &str, conservative_action: &str) {
+        let examples = if self.example_tids.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " Example tids: {}.",
+                self.example_tids
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        eprintln!(
+            "WARNING: detected {} out-of-order {} violation(s) across {} tid(s) while processing {}. {}{} Please fix the input ordering if possible.",
+            self.violations,
+            self.label,
+            self.affected_tids.len(),
+            context,
+            conservative_action,
+            examples
+        );
+    }
+}
+
 pub fn cmd_process(opts: ProcessOpts) -> Result<()> {
     let profile_dir = prepare_profile_dir(&opts.file)?;
 
@@ -230,6 +306,14 @@ pub fn cmd_process(opts: ProcessOpts) -> Result<()> {
 
 fn run_processing(profile_dir: &Path, output_dir: &Path, verbose: bool) -> Result<()> {
     let hint_index = HintIndex::load_if_exists(profile_dir)?;
+    if let Some(hint_index) = hint_index.as_ref() {
+        if let Some(ordering_issues) = hint_index.ordering_issues.as_ref() {
+            ordering_issues.warn(
+                "hints.jsonl",
+                "Hint events will be sorted conservatively before annotation.",
+            );
+        }
+    }
     let perf_script_src = profile_dir.join("perf.script");
     let perf_script_dst = output_dir.join("perf.script");
     let perf_jsonl_dst = output_dir.join("perf.jsonl");
@@ -688,6 +772,13 @@ fn parse_perf_script_to_jsonl(
 
     writer.flush()?;
 
+    if let Some(ordering_issues) = hint_annotator.and_then(HintAnnotator::finish) {
+        ordering_issues.warn(
+            &perf_script_path.display().to_string(),
+            "Hint lookup fell back conservatively for out-of-order samples.",
+        );
+    }
+
     let total = count + skipped + errors;
     println!(
         "Parsed {} of {} records ({} skipped, {} unparseable)",
@@ -736,6 +827,13 @@ fn parse_sched_perf_script_to_jsonl(
     }
 
     writer.flush()?;
+
+    if let Some(ordering_issues) = hint_annotator.and_then(HintAnnotator::finish) {
+        ordering_issues.warn(
+            &perf_script_path.display().to_string(),
+            "Hint lookup fell back conservatively for out-of-order samples.",
+        );
+    }
 
     let total = count + errors;
     println!(
