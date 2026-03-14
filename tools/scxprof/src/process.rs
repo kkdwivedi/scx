@@ -404,34 +404,49 @@ fn prepare_profile_dir(path: &Path) -> Result<PathBuf> {
         bail!("'{}' is not a directory or tar.gz archive", path.display());
     }
 
-    let dir_name = path_str.trim_end_matches(".tar.gz");
-    let output_dir = PathBuf::from(dir_name);
-
-    if output_dir.exists() {
-        return Ok(output_dir);
+    let desired_dir = PathBuf::from(path_str.trim_end_matches(".tar.gz"));
+    if desired_dir.exists() {
+        return Ok(desired_dir);
     }
 
+    validate_archive_layout(path)?;
+    fs::create_dir_all(&desired_dir).with_context(|| {
+        format!(
+            "failed to create extraction directory '{}'",
+            desired_dir.display()
+        )
+    })?;
+
     let status = Command::new("tar")
-        .args(["-xzf", &path_str, "-C", "."])
+        .args([
+            "-xzf",
+            &path_str,
+            "--strip-components=1",
+            "-C",
+            desired_dir
+                .to_str()
+                .context("invalid extraction directory path")?,
+        ])
         .status()
         .context("failed to run tar")?;
 
     if !status.success() {
+        let _ = fs::remove_dir_all(&desired_dir);
         bail!("tar extraction failed with status: {}", status);
     }
 
-    if !output_dir.exists() {
+    if !desired_dir.is_dir() {
         bail!(
-            "expected directory '{}' not found after extraction",
-            output_dir.display()
+            "expected extracted directory '{}' not found after extraction",
+            desired_dir.display()
         );
     }
 
-    Ok(output_dir)
+    Ok(desired_dir)
 }
 
 fn create_output_dir(profile_dir: &Path) -> Result<PathBuf> {
-    let output_dir = PathBuf::from(format!("{}.out", profile_dir.display()));
+    let output_dir = PathBuf::from(format!("{}.post", profile_dir.display()));
 
     if output_dir.exists() {
         bail!("output directory '{}' already exists", output_dir.display());
@@ -440,6 +455,50 @@ fn create_output_dir(profile_dir: &Path) -> Result<PathBuf> {
     fs::create_dir_all(&output_dir).context("failed to create output directory")?;
 
     Ok(output_dir)
+}
+
+fn validate_archive_layout(archive_path: &Path) -> Result<()> {
+    let archive_name = archive_path
+        .file_name()
+        .context("invalid archive path")?
+        .to_string_lossy()
+        .to_string();
+
+    let output = Command::new("tar")
+        .args(["-tzf", archive_path.to_str().context("invalid archive path")?])
+        .output()
+        .context("failed to inspect tar archive")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("failed to inspect tar archive: {}", stderr.trim());
+    }
+
+    let listing = String::from_utf8(output.stdout).context("tar listing was not valid UTF-8")?;
+    let mut top_levels = HashSet::new();
+
+    for line in listing.lines() {
+        let line = line.trim();
+        if line.is_empty() || line == "." {
+            continue;
+        }
+
+        let top = line.split('/').next().unwrap_or_default();
+        if top.is_empty() || top == "." {
+            continue;
+        }
+
+        top_levels.insert(top.to_string());
+    }
+
+    match top_levels.len() {
+        1 => Ok(()),
+        0 => bail!("archive '{}' appears to be empty", archive_name),
+        _ => bail!(
+            "archive '{}' contains multiple top-level entries; unable to extract into a single profile directory",
+            archive_name
+        ),
+    }
 }
 
 fn generate_perf_script(

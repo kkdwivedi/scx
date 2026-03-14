@@ -58,6 +58,10 @@ pub struct RecordOpts {
     #[clap(short, long, default_value = "scxprof.out")]
     pub output: PathBuf,
 
+    /// Output archive path for the recording
+    #[clap(short = 'f', long)]
+    pub file: Option<PathBuf>,
+
     /// Recording duration in seconds
     #[clap(short = 't', long, default_value = "30")]
     pub timeout: u64,
@@ -381,6 +385,10 @@ pub fn cmd_record(ctx: &Context, opts: RecordOpts) -> Result<()> {
         );
     }
 
+    if opts.disable_archive && opts.file.is_some() {
+        bail!("--file cannot be used with --disable-archive");
+    }
+
     fs::create_dir_all(&opts.output).context("failed to create output directory")?;
 
     save_perf_version(&opts.output)?;
@@ -423,7 +431,11 @@ pub fn cmd_record(ctx: &Context, opts: RecordOpts) -> Result<()> {
     }
 
     if !opts.disable_archive {
-        create_archive(&opts.output)?;
+        let archive_path = opts
+            .file
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(format!("{}.tar.gz", opts.output.display())));
+        create_archive(&opts.output, &archive_path)?;
         fs::remove_dir_all(&opts.output).context("failed to remove output directory")?;
     }
 
@@ -563,8 +575,8 @@ fn save_perf_version(output_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn create_archive(output_dir: &Path) -> Result<()> {
-    let archive_name = format!("{}.tar.gz", output_dir.display());
+fn create_archive(output_dir: &Path, archive_path: &Path) -> Result<()> {
+    let archive_root = archive_root_name(archive_path)?;
     let dir_name = output_dir
         .file_name()
         .context("invalid output directory name")?;
@@ -579,9 +591,17 @@ fn create_archive(output_dir: &Path) -> Result<()> {
     let status = Command::new("tar")
         .args([
             "-czf",
-            &archive_name,
+            archive_path
+                .to_str()
+                .context("invalid archive output path")?,
             "-C",
             parent.to_str().context("invalid parent path")?,
+            "--transform",
+            &format!(
+                "s,^{},{},",
+                dir_name.to_string_lossy(),
+                archive_root
+            ),
             dir_name.to_str().context("invalid directory name")?,
         ])
         .status()
@@ -592,6 +612,23 @@ fn create_archive(output_dir: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn archive_root_name(archive_path: &Path) -> Result<String> {
+    let file_name = archive_path
+        .file_name()
+        .context("invalid archive output path")?
+        .to_string_lossy();
+
+    let archive_root = file_name
+        .strip_suffix(".tar.gz")
+        .context("archive path must end with .tar.gz")?;
+
+    if archive_root.is_empty() {
+        bail!("archive path must include a basename before .tar.gz");
+    }
+
+    Ok(archive_root.to_string())
 }
 
 /// Fields to extract from perf mem script output
