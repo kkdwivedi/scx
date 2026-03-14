@@ -956,3 +956,130 @@ fn print_profile_contents(profile_dir: &Path) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::de::DeserializeOwned;
+    use tempfile::TempDir;
+
+    fn test_data_dir(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("data")
+            .join(name)
+    }
+
+    fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+        fs::create_dir_all(dst)?;
+        for entry in fs::read_dir(src)? {
+            let entry = entry?;
+            let src_path = entry.path();
+            let dst_path = dst.join(entry.file_name());
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                copy_dir_recursive(&src_path, &dst_path)?;
+            } else {
+                fs::copy(&src_path, &dst_path)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn materialize_test_profile(name: &str) -> Result<(TempDir, PathBuf)> {
+        let tempdir = TempDir::new()?;
+        let profile_dir = tempdir.path().join(name);
+        copy_dir_recursive(&test_data_dir(name), &profile_dir)?;
+        Ok((tempdir, profile_dir))
+    }
+
+    fn read_jsonl<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
+        let file = File::open(path)?;
+        let reader = BufReader::new(file);
+        reader
+            .lines()
+            .map(|line| {
+                let line = line?;
+                serde_json::from_str(&line).context("failed to parse jsonl line")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn parse_perf_mem_line_interprets_first_id_as_pid_and_second_as_tid() {
+        let record = parse_perf_mem_script_line(
+            "alpha worker 1000/2001 0.000000050: 1 /cg 2 foo (bar.so) 3 4K",
+        )
+        .expect("expected mem record to parse");
+
+        assert_eq!(record.comm, "alpha worker");
+        assert_eq!(record.pid, 1000);
+        assert_eq!(record.tid, 2001);
+        assert_eq!(record.sample_time_ns, Some(50));
+    }
+
+    #[test]
+    fn process_annotates_mem_and_sched_records_with_thread_hints() -> Result<()> {
+        let (_tempdir, profile_dir) = materialize_test_profile("profile_basic")?;
+        let output_dir = profile_dir.with_extension("post");
+        fs::create_dir_all(&output_dir)?;
+
+        run_processing(&profile_dir, &output_dir, false)?;
+
+        let mem_records: Vec<PerfMemRecord> = read_jsonl(&output_dir.join(PERF_MEM_JSONL_FILE))?;
+        let sched_records: Vec<PerfSchedScriptRecord> =
+            read_jsonl(&output_dir.join(PERF_SCHED_JSONL_FILE))?;
+
+        let mem_hints: Vec<u64> = mem_records.iter().map(|record| record.hint).collect();
+        let sched_hints: Vec<u64> = sched_records.iter().map(|record| record.hint).collect();
+
+        assert_eq!(mem_records[0].pid, 1000);
+        assert_eq!(mem_records[0].tid, 2001);
+        assert_eq!(mem_hints, vec![0, 7, 7, 9, 0, 5, 5, 0]);
+        assert_eq!(sched_hints, vec![0, 7, 9, 0, 5, 0]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn hint_annotation_handles_out_of_order_hints_and_samples_conservatively() -> Result<()> {
+        let (_tempdir, profile_dir) = materialize_test_profile("profile_out_of_order")?;
+        let hint_index = HintIndex::load_if_exists(&profile_dir)?
+            .expect("expected hints index to be loaded");
+
+        assert!(hint_index.ordering_issues.is_some());
+
+        let perf_script_path = profile_dir.join(PERF_MEM_SCRIPT_FILE);
+        let output_path = profile_dir.join(PERF_MEM_JSONL_FILE);
+        let artifacts = TraceArtifacts {
+            data_file: PERF_MEM_DATA_FILE,
+            script_file: PERF_MEM_SCRIPT_FILE,
+            jsonl_file: PERF_MEM_JSONL_FILE,
+            script_fields: PERF_MEM_SCRIPT_FIELDS,
+            script_kind: "perf.mem.script",
+            jsonl_kind: "perf.mem.jsonl",
+        };
+
+        parse_perf_mem_script_to_jsonl(
+            &perf_script_path,
+            &output_path,
+            Some(&hint_index),
+            artifacts,
+            false,
+        )?;
+
+        let records: Vec<PerfMemRecord> = read_jsonl(&output_path)?;
+        let hints: Vec<u64> = records.iter().map(|record| record.hint).collect();
+
+        assert_eq!(hints, vec![9, 7]);
+
+        let mut annotator = HintAnnotator::new(&hint_index);
+        for line in fs::read_to_string(&perf_script_path)?.lines() {
+            let mut record = parse_perf_mem_script_line(line).expect("expected mem record");
+            annotator.annotate(&mut record);
+        }
+        assert!(annotator.finish().is_some());
+
+        Ok(())
+    }
+}
