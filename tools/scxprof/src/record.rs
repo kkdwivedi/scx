@@ -168,12 +168,12 @@ struct HintsEventRecord {
 }
 
 struct HintsRecorder<'a> {
-    _open_object: Box<MaybeUninit<OpenObject>>,
-    skel: BpfSkel<'a>,
     link: Option<libbpf_rs::Link>,
     ringbuf: libbpf_rs::RingBuffer<'a>,
     events: Rc<RefCell<Vec<HintsEventRecord>>>,
     writer: BufWriter<File>,
+    skel: BpfSkel<'a>,
+    _open_object: Box<MaybeUninit<OpenObject>>,
 }
 
 impl HintsRecorder<'static> {
@@ -249,12 +249,12 @@ impl HintsRecorder<'static> {
         let writer = BufWriter::new(file);
 
         Ok(Self {
-            _open_object: unsafe { Box::from_raw(open_object_ptr) },
-            skel,
             link: Some(link),
             ringbuf,
             events,
             writer,
+            skel,
+            _open_object: unsafe { Box::from_raw(open_object_ptr) },
         })
     }
 
