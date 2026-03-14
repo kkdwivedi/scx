@@ -9,7 +9,7 @@ use crate::Context;
 use anyhow::{bail, Context as _, Result};
 use clap::Parser;
 use libbpf_rs::skel::{OpenSkel, SkelBuilder};
-use libbpf_rs::{OpenObject, RingBufferBuilder};
+use libbpf_rs::{MapCore, MapHandle, OpenObject, RingBufferBuilder};
 use serde::Serialize;
 use std::cell::RefCell;
 use std::fs::{self, File};
@@ -50,6 +50,7 @@ pub const PERF_MEM_JSONL_FILE: &str = "perf.mem.jsonl";
 pub const PERF_SCHED_DATA_FILE: &str = "perf.sched.data";
 pub const PERF_SCHED_SCRIPT_FILE: &str = "perf.sched.script";
 pub const PERF_SCHED_JSONL_FILE: &str = "perf.sched.jsonl";
+const DEFAULT_PERF_MMAP_SIZE: &str = "8M";
 
 #[derive(Debug, Parser)]
 pub struct RecordOpts {
@@ -84,6 +85,10 @@ pub struct RecordOpts {
     /// Disable recording sched/irq trace events into perf.sched.data
     #[clap(long)]
     pub disable_sched_trace: bool,
+
+    /// Disable recording perf mem trace into perf.mem.data
+    #[clap(long)]
+    pub disable_mem_trace: bool,
 }
 
 struct SpawnedProcess {
@@ -172,7 +177,7 @@ struct HintsRecorder<'a> {
 }
 
 impl HintsRecorder<'static> {
-    fn new(hints_path: PathBuf, ring_sz: u32) -> Result<Self> {
+    fn new(hints_path: PathBuf, hints_map_path: PathBuf, ring_sz: u32) -> Result<Self> {
         let open_object = Box::new(MaybeUninit::uninit());
         let open_object_ptr = Box::into_raw(open_object);
 
@@ -190,8 +195,26 @@ impl HintsRecorder<'static> {
             .set_max_entries(ring_sz * 1024 * 1024)
             .context("failed to set ringbuf size")?;
 
-        let skel = open_skel.load().context("failed to load BPF skeleton")?;
+        let hints_map = MapHandle::from_pinned_path(&hints_map_path).with_context(|| {
+            format!(
+                "failed to open pinned hints map '{}'",
+                hints_map_path.display()
+            )
+        })?;
+        let hints_map_id = hints_map
+            .info()
+            .context("failed to query hints map info")?
+            .info
+            .id;
+        open_skel
+            .maps
+            .bss_data
+            .as_mut()
+            .context("missing BPF bss data")?
+            .hints_bss
+            .target_map_id = hints_map_id;
 
+        let skel = open_skel.load().context("failed to load BPF skeleton")?;
         let link = skel
             .progs
             .trace_map_update
@@ -270,7 +293,7 @@ impl Drop for HintsRecorder<'_> {
             .maps
             .bss_data
             .as_ref()
-            .map(|bss| bss.dropped_events)
+            .map(|bss| bss.hints_bss.dropped_events)
             .unwrap_or(0);
         if dropped > 0 {
             eprintln!(
@@ -408,21 +431,31 @@ pub fn cmd_record(ctx: &Context, opts: RecordOpts) -> Result<()> {
 }
 
 fn run_recording(ctx: &Context, opts: &RecordOpts) -> Result<bool> {
-    let perf_data_path = opts.output.join(PERF_MEM_DATA_FILE);
-    let mem_perf_args = vec![
-        perf_binary(),
-        "mem".to_string(),
-        "record".to_string(),
-        "--all-cgroups".to_string(),
-        "-p".to_string(),
-        "--data-page-size".to_string(),
-        "--ldlat".to_string(),
-        opts.ldlat.to_string(),
-        "-o".to_string(),
-        perf_data_path.to_string_lossy().to_string(),
-    ];
+    let hints_trace_enabled = opts.hints_map.is_some();
+    if opts.disable_mem_trace && opts.disable_sched_trace && !hints_trace_enabled {
+        bail!("at least one of mem trace, sched trace, or hints trace must be enabled");
+    }
 
-    let mut processes = vec![SpawnedProcess::spawn(&mem_perf_args)?];
+    let mut processes = Vec::new();
+
+    if !opts.disable_mem_trace {
+        let perf_data_path = opts.output.join(PERF_MEM_DATA_FILE);
+        let mem_perf_args = vec![
+            perf_binary(),
+            "mem".to_string(),
+            "record".to_string(),
+            "--all-cgroups".to_string(),
+            "-p".to_string(),
+            "--data-page-size".to_string(),
+            "--ldlat".to_string(),
+            opts.ldlat.to_string(),
+            "-m".to_string(),
+            format!("{0},{0}", DEFAULT_PERF_MMAP_SIZE),
+            "-o".to_string(),
+            perf_data_path.to_string_lossy().to_string(),
+        ];
+        processes.push(SpawnedProcess::spawn(&mem_perf_args)?);
+    }
 
     if !opts.disable_sched_trace {
         let sched_data_path = opts.output.join(PERF_SCHED_DATA_FILE);
@@ -430,6 +463,8 @@ fn run_recording(ctx: &Context, opts: &RecordOpts) -> Result<bool> {
             perf_binary(),
             "record".to_string(),
             "-a".to_string(),
+            "-m".to_string(),
+            DEFAULT_PERF_MMAP_SIZE.to_string(),
             "-o".to_string(),
             sched_data_path.to_string_lossy().to_string(),
         ];
@@ -442,7 +477,11 @@ fn run_recording(ctx: &Context, opts: &RecordOpts) -> Result<bool> {
 
     let hints_recorder = if opts.hints_map.is_some() {
         let hints_path = opts.output.join("hints.jsonl");
-        Some(HintsRecorder::new(hints_path, opts.hints_map_ring_sz)?)
+        Some(HintsRecorder::new(
+            hints_path,
+            opts.hints_map.clone().unwrap(),
+            opts.hints_map_ring_sz,
+        )?)
     } else {
         None
     };

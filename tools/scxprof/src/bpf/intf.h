@@ -13,4 +13,9 @@ struct hints_event {
     unsigned long long timestamp;
 };
 
+struct hints_bss {
+    unsigned long long dropped_events;
+    unsigned int target_map_id;
+};
+
 #endif
