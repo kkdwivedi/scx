@@ -4,6 +4,7 @@
 // GNU General Public License version 2.
 
 #include <linux/types.h>
+#include <bpf/bpf_core_read.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include "intf.h"
@@ -46,10 +47,16 @@ int BPF_PROG(trace_map_update, struct bpf_map *map, struct file *file, void *key
 {
     struct hints_event *ev;
     unsigned long hints;
+    enum bpf_map_type map_type;
+    unsigned int map_id;
+    struct task_struct *task;
 
-    if (map->map_type != BPF_MAP_TYPE_TASK_STORAGE)
+    map_type = BPF_CORE_READ(map, map_type);
+    if (map_type != BPF_MAP_TYPE_TASK_STORAGE)
         return 0;
-    if (map->id != hints_bss.target_map_id)
+
+    map_id = BPF_CORE_READ(map, id);
+    if (map_id != hints_bss.target_map_id)
         return 0;
 
     if (bpf_probe_read_kernel(&hints, sizeof(hints), value))
@@ -61,9 +68,9 @@ int BPF_PROG(trace_map_update, struct bpf_map *map, struct file *file, void *key
         return 0;
     }
 
-    struct task_struct *task = bpf_get_current_task_btf();
-    ev->pid = task->pid;
-    ev->tgid = task->tgid;
+    task = bpf_get_current_task_btf();
+    ev->pid = BPF_CORE_READ(task, pid);
+    ev->tgid = BPF_CORE_READ(task, tgid);
     ev->hints = hints;
     ev->timestamp = bpf_ktime_get_ns();
 
