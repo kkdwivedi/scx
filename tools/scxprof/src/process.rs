@@ -3,14 +3,17 @@
 // This software may be used and distributed according to the terms of the
 // GNU General Public License version 2.
 
-use crate::record::{perf_binary, PERF_SCRIPT_FIELDS};
+use crate::record::{perf_binary, PERF_SCHED_SCRIPT_FIELDS, PERF_SCRIPT_FIELDS};
 use anyhow::{bail, Context as _, Result};
 use clap::Parser;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Number, Value};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 #[derive(Debug, Parser)]
 pub struct ProcessOpts {
@@ -39,6 +42,20 @@ pub struct PerfScriptRecord {
     pub data_page_size: u64,
 }
 
+/// Represents a single sched trace record from perf script
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerfSchedScriptRecord {
+    pub comm: String,
+    pub pid: i32,
+    pub tid: i32,
+    pub cpu: u32,
+    pub time: f64,
+    pub event: String,
+    pub trace: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fields: Option<Map<String, Value>>,
+}
+
 pub fn cmd_process(opts: ProcessOpts) -> Result<()> {
     let profile_dir = prepare_profile_dir(&opts.file)?;
 
@@ -58,10 +75,18 @@ fn run_processing(profile_dir: &Path, output_dir: &Path, verbose: bool) -> Resul
     let perf_script_src = profile_dir.join("perf.script");
     let perf_script_dst = output_dir.join("perf.script");
     let perf_jsonl_dst = output_dir.join("perf.jsonl");
+    let sched_perf_data_src = profile_dir.join("perf.sched.data");
+    let sched_perf_script_src = profile_dir.join("perf.sched.script");
+    let sched_perf_script_dst = output_dir.join("perf.sched.script");
+    let sched_perf_jsonl_dst = output_dir.join("perf.sched.jsonl");
 
     if !perf_script_src.exists() {
         println!("Generating perf.script from perf.data...");
-        generate_perf_script(profile_dir)?;
+        generate_perf_script(
+            &profile_dir.join("perf.data"),
+            &perf_script_src,
+            PERF_SCRIPT_FIELDS,
+        )?;
     }
 
     println!("Copying perf.script...");
@@ -69,6 +94,24 @@ fn run_processing(profile_dir: &Path, output_dir: &Path, verbose: bool) -> Resul
 
     println!("Parsing perf.script to generate perf.jsonl...");
     parse_perf_script_to_jsonl(&perf_script_dst, &perf_jsonl_dst, verbose)?;
+
+    if sched_perf_script_src.exists() || sched_perf_data_src.exists() {
+        if !sched_perf_script_src.exists() {
+            println!("Generating perf.sched.script from perf.sched.data...");
+            generate_perf_script(
+                &sched_perf_data_src,
+                &sched_perf_script_src,
+                PERF_SCHED_SCRIPT_FIELDS,
+            )?;
+        }
+
+        println!("Copying perf.sched.script...");
+        fs::copy(&sched_perf_script_src, &sched_perf_script_dst)
+            .context("failed to copy perf.sched.script")?;
+
+        println!("Parsing perf.sched.script to generate perf.sched.jsonl...");
+        parse_sched_perf_script_to_jsonl(&sched_perf_script_dst, &sched_perf_jsonl_dst, verbose)?;
+    }
 
     print_profile_contents(output_dir)?;
     Ok(())
@@ -122,19 +165,20 @@ fn create_output_dir(profile_dir: &Path) -> Result<PathBuf> {
     Ok(output_dir)
 }
 
-fn generate_perf_script(profile_dir: &Path) -> Result<()> {
-    let perf_data_path = profile_dir.join("perf.data");
-    let perf_script_path = profile_dir.join("perf.script");
-
+fn generate_perf_script(
+    perf_data_path: &Path,
+    perf_script_path: &Path,
+    fields: &str,
+) -> Result<()> {
     if !perf_data_path.exists() {
-        bail!("perf.data not found in profile directory");
+        bail!("perf data file '{}' not found", perf_data_path.display());
     }
 
     let output = Command::new(perf_binary())
         .args([
             "script",
             "-F",
-            PERF_SCRIPT_FIELDS,
+            fields,
             "-i",
             perf_data_path.to_str().context("invalid perf.data path")?,
         ])
@@ -149,6 +193,36 @@ fn generate_perf_script(profile_dir: &Path) -> Result<()> {
     fs::write(&perf_script_path, &output.stdout).context("failed to write perf.script")?;
 
     Ok(())
+}
+
+fn sched_line_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"^\s*(?P<comm>.*?)\s+(?P<pid>-?\d+)/(?P<tid>-?\d+)\s+\[(?P<cpu>\d+)\]\s+(?P<time>\d+\.\d+):\s+(?P<event>[^:]+:[^:]+):\s*(?P<trace>.*)$",
+        )
+        .unwrap()
+    })
+}
+
+fn sched_switch_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"^(?P<prev_comm>.+?):(?P<prev_pid>-?\d+)\s+\[(?P<prev_prio>-?\d+)\]\s+(?P<prev_state>.+?)\s+==>\s+(?P<next_comm>.+?):(?P<next_pid>-?\d+)\s+\[(?P<next_prio>-?\d+)\]$",
+        )
+        .unwrap()
+    })
+}
+
+fn kv_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(\w+)=([^\s\]]+)").unwrap())
+}
+
+fn action_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\[action=([^\]]+)\]").unwrap())
 }
 
 fn parse_page_size(s: &str) -> u64 {
@@ -245,6 +319,111 @@ fn parse_perf_script_line(line: &str) -> Option<PerfScriptRecord> {
     })
 }
 
+fn maybe_int_value(value: &str) -> Value {
+    match value.parse::<i64>() {
+        Ok(num) => Value::Number(Number::from(num)),
+        Err(_) => Value::String(value.to_string()),
+    }
+}
+
+fn parse_sched_fields(event: &str, trace: &str) -> Option<Map<String, Value>> {
+    let mut fields = Map::new();
+
+    if event == "sched:sched_switch" {
+        let captures = sched_switch_re().captures(trace)?;
+        let prev_comm = captures.name("prev_comm")?.as_str();
+        let prev_pid = captures.name("prev_pid")?.as_str().parse::<i64>().ok()?;
+        let prev_prio = captures.name("prev_prio")?.as_str().parse::<i64>().ok()?;
+        let prev_state = captures.name("prev_state")?.as_str();
+        let next_comm = captures.name("next_comm")?.as_str();
+        let next_pid = captures.name("next_pid")?.as_str().parse::<i64>().ok()?;
+        let next_prio = captures.name("next_prio")?.as_str().parse::<i64>().ok()?;
+
+        fields.insert(
+            "prev_comm".to_string(),
+            Value::String(prev_comm.to_string()),
+        );
+        fields.insert(
+            "prev_pid".to_string(),
+            Value::Number(Number::from(prev_pid)),
+        );
+        fields.insert(
+            "prev_prio".to_string(),
+            Value::Number(Number::from(prev_prio)),
+        );
+        fields.insert(
+            "prev_state".to_string(),
+            Value::String(prev_state.to_string()),
+        );
+        fields.insert(
+            "next_comm".to_string(),
+            Value::String(next_comm.to_string()),
+        );
+        fields.insert(
+            "next_pid".to_string(),
+            Value::Number(Number::from(next_pid)),
+        );
+        fields.insert(
+            "next_prio".to_string(),
+            Value::Number(Number::from(next_prio)),
+        );
+        fields.insert(
+            "cpu_idle".to_string(),
+            Value::Bool(next_pid == 0 || next_comm.starts_with("swapper")),
+        );
+        fields.insert(
+            "prev_idle".to_string(),
+            Value::Bool(prev_pid == 0 || prev_comm.starts_with("swapper")),
+        );
+        return Some(fields);
+    }
+
+    for captures in kv_re().captures_iter(trace) {
+        fields.insert(
+            captures[1].to_string(),
+            maybe_int_value(captures.get(2).unwrap().as_str()),
+        );
+    }
+
+    if let Some(captures) = action_re().captures(trace) {
+        fields.insert("action".to_string(), Value::String(captures[1].to_string()));
+    }
+
+    if fields.is_empty() {
+        None
+    } else {
+        Some(fields)
+    }
+}
+
+fn parse_sched_perf_script_line(line: &str) -> Option<PerfSchedScriptRecord> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+
+    let captures = sched_line_re().captures(line)?;
+    let comm = captures.name("comm")?.as_str().trim().to_string();
+    let pid = captures.name("pid")?.as_str().parse::<i32>().ok()?;
+    let tid = captures.name("tid")?.as_str().parse::<i32>().ok()?;
+    let cpu = captures.name("cpu")?.as_str().parse::<u32>().ok()?;
+    let time = captures.name("time")?.as_str().parse::<f64>().ok()?;
+    let event = captures.name("event")?.as_str().trim().to_string();
+    let trace = captures.name("trace")?.as_str().trim().to_string();
+    let fields = parse_sched_fields(&event, &trace);
+
+    Some(PerfSchedScriptRecord {
+        comm,
+        pid,
+        tid,
+        cpu,
+        time,
+        event,
+        trace,
+        fields,
+    })
+}
+
 fn parse_perf_script_to_jsonl(
     perf_script_path: &Path,
     output_path: &Path,
@@ -299,6 +478,50 @@ fn parse_perf_script_to_jsonl(
     println!(
         "Parsed {} of {} records ({} skipped, {} unparseable)",
         count, total, skipped, errors
+    );
+
+    Ok(())
+}
+
+fn parse_sched_perf_script_to_jsonl(
+    perf_script_path: &Path,
+    output_path: &Path,
+    verbose: bool,
+) -> Result<()> {
+    let file = File::open(perf_script_path).context("failed to open perf.sched.script")?;
+    let reader = BufReader::new(file);
+
+    let output_file = File::create(output_path).context("failed to create perf.sched.jsonl")?;
+    let mut writer = BufWriter::new(output_file);
+
+    let mut count = 0;
+    let mut errors = 0;
+
+    for line in reader.lines() {
+        let line = line.context("failed to read line")?;
+        match parse_sched_perf_script_line(&line) {
+            Some(record) => {
+                let json = serde_json::to_string(&record).context("failed to serialize record")?;
+                writeln!(writer, "{}", json)?;
+                count += 1;
+            }
+            None => {
+                if !line.trim().is_empty() {
+                    errors += 1;
+                    if verbose {
+                        eprintln!("unparseable sched line: {}", line);
+                    }
+                }
+            }
+        }
+    }
+
+    writer.flush()?;
+
+    let total = count + errors;
+    println!(
+        "Parsed {} of {} sched trace records ({} unparseable)",
+        count, total, errors
     );
 
     Ok(())

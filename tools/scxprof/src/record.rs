@@ -26,6 +26,24 @@ pub fn perf_binary() -> String {
     std::env::var("SCXPROF_PERF").unwrap_or_else(|_| "perf".to_string())
 }
 
+const SCHED_TRACE_EVENTS: &[&str] = &[
+    "sched:sched_switch",
+    "sched:sched_wakeup",
+    "sched:sched_wakeup_new",
+    "sched:sched_waking",
+    "sched:sched_stat_runtime",
+    "irq:irq_handler_entry",
+    "irq:irq_handler_exit",
+    "irq:softirq_entry",
+    "irq:softirq_exit",
+    "irq:softirq_raise",
+    "irq_vectors:local_timer_entry",
+    "irq_vectors:local_timer_exit",
+    "irq_vectors:reschedule_entry",
+    "irq_vectors:reschedule_exit",
+    "nmi:nmi_handler",
+];
+
 #[derive(Debug, Parser)]
 pub struct RecordOpts {
     /// Output directory for recording
@@ -55,6 +73,10 @@ pub struct RecordOpts {
     /// Generate perf.script file during recording
     #[clap(long)]
     pub enable_perf_script: bool,
+
+    /// Disable recording sched/irq trace events into perf.sched.data
+    #[clap(long)]
+    pub disable_sched_trace: bool,
 }
 
 struct SpawnedProcess {
@@ -256,20 +278,35 @@ impl Drop for HintsRecorder<'_> {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum PollResult {
     Shutdown,
-    ProcessExited,
+    ProcessExited(usize),
     RingbufReady,
     Timeout,
 }
 
-fn poll_fds(fds: &[RawFd], timeout_ms: i32) -> Result<PollResult> {
-    let mut pollfds: Vec<libc::pollfd> = fds
-        .iter()
-        .map(|&fd| libc::pollfd {
+fn poll_fds(
+    shutdown_fd: RawFd,
+    process_fds: &[RawFd],
+    ringbuf_fd: Option<RawFd>,
+    timeout_ms: i32,
+) -> Result<PollResult> {
+    let mut pollfds = Vec::with_capacity(1 + process_fds.len() + usize::from(ringbuf_fd.is_some()));
+    pollfds.push(libc::pollfd {
+        fd: shutdown_fd,
+        events: libc::POLLIN,
+        revents: 0,
+    });
+    pollfds.extend(process_fds.iter().map(|&fd| libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    }));
+    if let Some(fd) = ringbuf_fd {
+        pollfds.push(libc::pollfd {
             fd,
             events: libc::POLLIN,
             revents: 0,
-        })
-        .collect();
+        });
+    }
 
     let ret = unsafe {
         libc::poll(
@@ -294,10 +331,12 @@ fn poll_fds(fds: &[RawFd], timeout_ms: i32) -> Result<PollResult> {
     if pollfds[0].revents & libc::POLLIN != 0 {
         return Ok(PollResult::Shutdown);
     }
-    if pollfds[1].revents & libc::POLLIN != 0 {
-        return Ok(PollResult::ProcessExited);
+    for (idx, pollfd) in pollfds[1..=process_fds.len()].iter().enumerate() {
+        if pollfd.revents & libc::POLLIN != 0 {
+            return Ok(PollResult::ProcessExited(idx));
+        }
     }
-    if fds.len() > 2 && pollfds[2].revents & libc::POLLIN != 0 {
+    if ringbuf_fd.is_some() && pollfds.last().unwrap().revents & libc::POLLIN != 0 {
         return Ok(PollResult::RingbufReady);
     }
 
@@ -331,8 +370,25 @@ pub fn cmd_record(ctx: &Context, opts: RecordOpts) -> Result<()> {
 
     if opts.enable_perf_script {
         println!("Generating perf.script...");
-        if let Err(e) = generate_perf_script(ctx, &opts.output) {
+        if let Err(e) = generate_perf_script(
+            ctx,
+            &opts.output.join("perf.data"),
+            &opts.output.join("perf.script"),
+            PERF_SCRIPT_FIELDS,
+        ) {
             eprintln!("warning: failed to generate perf.script: {}", e);
+        }
+
+        if !opts.disable_sched_trace && opts.output.join("perf.sched.data").exists() {
+            println!("Generating perf.sched.script...");
+            if let Err(e) = generate_perf_script(
+                ctx,
+                &opts.output.join("perf.sched.data"),
+                &opts.output.join("perf.sched.script"),
+                PERF_SCHED_SCRIPT_FIELDS,
+            ) {
+                eprintln!("warning: failed to generate perf.sched.script: {}", e);
+            }
         }
     }
 
@@ -346,7 +402,7 @@ pub fn cmd_record(ctx: &Context, opts: RecordOpts) -> Result<()> {
 
 fn run_recording(ctx: &Context, opts: &RecordOpts) -> Result<bool> {
     let perf_data_path = opts.output.join("perf.data");
-    let perf_args = vec![
+    let mem_perf_args = vec![
         perf_binary(),
         "mem".to_string(),
         "record".to_string(),
@@ -359,7 +415,23 @@ fn run_recording(ctx: &Context, opts: &RecordOpts) -> Result<bool> {
         perf_data_path.to_string_lossy().to_string(),
     ];
 
-    let mut perf = SpawnedProcess::spawn(&perf_args)?;
+    let mut processes = vec![SpawnedProcess::spawn(&mem_perf_args)?];
+
+    if !opts.disable_sched_trace {
+        let sched_data_path = opts.output.join("perf.sched.data");
+        let mut sched_perf_args = vec![
+            perf_binary(),
+            "record".to_string(),
+            "-a".to_string(),
+            "-o".to_string(),
+            sched_data_path.to_string_lossy().to_string(),
+        ];
+        for event in SCHED_TRACE_EVENTS {
+            sched_perf_args.push("-e".to_string());
+            sched_perf_args.push((*event).to_string());
+        }
+        processes.push(SpawnedProcess::spawn(&sched_perf_args)?);
+    }
 
     let hints_recorder = if opts.hints_map.is_some() {
         let hints_path = opts.output.join("hints.jsonl");
@@ -368,35 +440,51 @@ fn run_recording(ctx: &Context, opts: &RecordOpts) -> Result<bool> {
         None
     };
 
-    let mut fds = vec![ctx.shutdown_fd(), perf.pidfd()];
-    if let Some(ref recorder) = hints_recorder {
-        fds.push(recorder.ringbuf_fd());
-    }
-
     let mut hints_recorder = hints_recorder;
     let timeout = Duration::from_secs(opts.timeout);
     let start = Instant::now();
     let mut completed = true;
 
     loop {
+        let process_fds: Vec<_> = processes.iter().map(SpawnedProcess::pidfd).collect();
+        let ringbuf_fd = hints_recorder.as_ref().map(HintsRecorder::ringbuf_fd);
         let elapsed = start.elapsed();
         if elapsed >= timeout {
-            perf.signal(libc::SIGINT);
-            perf.wait()?;
+            for process in &processes {
+                process.signal(libc::SIGINT);
+            }
+            for process in &mut processes {
+                process.wait()?;
+            }
             break;
         }
 
         let remaining_ms = (timeout - elapsed).as_millis().min(100) as i32;
 
-        match poll_fds(&fds, remaining_ms)? {
+        match poll_fds(ctx.shutdown_fd(), &process_fds, ringbuf_fd, remaining_ms)? {
             PollResult::Shutdown => {
-                perf.signal(libc::SIGKILL);
-                perf.wait()?;
+                for process in &processes {
+                    process.signal(libc::SIGKILL);
+                }
+                for process in &mut processes {
+                    process.wait()?;
+                }
                 completed = false;
                 break;
             }
-            PollResult::ProcessExited => {
-                perf.wait()?;
+            PollResult::ProcessExited(exited_idx) => {
+                let exited_result = processes[exited_idx].wait();
+                for (idx, process) in processes.iter().enumerate() {
+                    if idx != exited_idx {
+                        process.signal(libc::SIGINT);
+                    }
+                }
+                for (idx, process) in processes.iter_mut().enumerate() {
+                    if idx != exited_idx {
+                        process.wait()?;
+                    }
+                }
+                exited_result?;
                 break;
             }
             PollResult::RingbufReady | PollResult::Timeout => {
@@ -464,12 +552,17 @@ fn create_archive(output_dir: &Path) -> Result<()> {
 pub const PERF_SCRIPT_FIELDS: &str =
     "comm,tid,pid,time,cgroup,ip,addr,phys_addr,data_page_size,dso,sym";
 
-fn generate_perf_script(ctx: &Context, output_dir: &Path) -> Result<()> {
-    let perf_data_path = output_dir.join("perf.data");
-    let perf_script_path = output_dir.join("perf.script");
+/// Fields to extract from sched trace perf script output
+pub const PERF_SCHED_SCRIPT_FIELDS: &str = "comm,pid,tid,cpu,time,event,trace";
 
+fn generate_perf_script(
+    ctx: &Context,
+    perf_data_path: &Path,
+    perf_script_path: &Path,
+    fields: &str,
+) -> Result<()> {
     if !perf_data_path.exists() {
-        bail!("perf.data not found in output directory");
+        bail!("perf data file '{}' not found", perf_data_path.display());
     }
 
     let output_file = File::create(&perf_script_path).context("failed to create perf.script")?;
@@ -478,7 +571,7 @@ fn generate_perf_script(ctx: &Context, output_dir: &Path) -> Result<()> {
         .args([
             "script",
             "-F",
-            PERF_SCRIPT_FIELDS,
+            fields,
             "-i",
             perf_data_path.to_str().context("invalid perf.data path")?,
         ])
@@ -495,17 +588,16 @@ fn generate_perf_script(ctx: &Context, output_dir: &Path) -> Result<()> {
     let pidfd = unsafe { OwnedFd::from_raw_fd(fd) };
 
     let mut child = child;
-    let fds = [ctx.shutdown_fd(), pidfd.as_raw_fd()];
 
     loop {
-        match poll_fds(&fds, 100)? {
+        match poll_fds(ctx.shutdown_fd(), &[pidfd.as_raw_fd()], None, 100)? {
             PollResult::Shutdown => {
                 unsafe { libc::kill(pid, libc::SIGKILL) };
                 let _ = child.wait();
                 let _ = fs::remove_file(&perf_script_path);
                 bail!("perf script interrupted");
             }
-            PollResult::ProcessExited => {
+            PollResult::ProcessExited(_) => {
                 let status = child.wait().context("failed to wait for perf script")?;
                 if !status.success() {
                     let _ = fs::remove_file(&perf_script_path);
