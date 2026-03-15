@@ -846,9 +846,9 @@ mod tests {
             &[
                 r#"{"comm":"idle","pid":0,"tid":0,"cpu":0,"time":0.0,"event":"sched:sched_switch","trace":"swapper/0:0 [120] R ==> worker-a:10 [120]","fields":{"prev_comm":"swapper/0","prev_pid":0,"prev_prio":120,"prev_state":"R","next_comm":"worker-a","next_pid":10,"next_prio":120},"hint":0}"#,
                 r#"{"comm":"worker-a","pid":10,"tid":10,"cpu":0,"time":0.0005,"event":"sched:sched_stat_runtime","trace":"comm=worker-a runtime=500000 [ns] vruntime=0 [ns]","fields":{"comm":"worker-a","runtime":500000,"vruntime":0},"hint":640}"#,
-                r#"{"comm":"worker-a","pid":10,"tid":10,"cpu":0,"time":0.001,"event":"sched:sched_switch","trace":"worker-a:10 [120] R ==> swapper/0:0 [120]","fields":{"prev_comm":"worker-a","prev_pid":10,"prev_prio":120,"prev_state":"R","next_comm":"swapper/0","next_pid":0,"next_prio":120,"next_hint":0},"hint":640}"#,
-                r#"{"comm":"idle","pid":0,"tid":0,"cpu":0,"time":0.001,"event":"sched:sched_switch","trace":"swapper/0:0 [120] R ==> svc-4:20 [120]","fields":{"prev_comm":"swapper/0","prev_pid":0,"prev_prio":120,"prev_state":"R","next_comm":"svc-4","next_pid":20,"next_prio":120,"next_hint":0},"hint":0}"#,
-                r#"{"comm":"svc-4","pid":20,"tid":20,"cpu":0,"time":0.002,"event":"sched:sched_switch","trace":"svc-4:20 [120] R ==> swapper/0:0 [120]","fields":{"prev_comm":"svc-4","prev_pid":20,"prev_prio":120,"prev_state":"R","next_comm":"swapper/0","next_pid":0,"next_prio":120,"next_hint":0},"hint":0}"#,
+                r#"{"comm":"worker-a","pid":10,"tid":10,"cpu":0,"time":0.001,"event":"sched:sched_switch","trace":"worker-a:10 [120] R ==> swapper/0:0 [120]","fields":{"prev_comm":"worker-a","prev_pid":10,"prev_prio":120,"prev_state":"R","next_comm":"swapper/0","next_pid":0,"next_prio":120},"hint":640}"#,
+                r#"{"comm":"idle","pid":0,"tid":0,"cpu":0,"time":0.001,"event":"sched:sched_switch","trace":"swapper/0:0 [120] R ==> svc-4:20 [120]","fields":{"prev_comm":"swapper/0","prev_pid":0,"prev_prio":120,"prev_state":"R","next_comm":"svc-4","next_pid":20,"next_prio":120},"hint":0}"#,
+                r#"{"comm":"svc-4","pid":20,"tid":20,"cpu":0,"time":0.002,"event":"sched:sched_switch","trace":"svc-4:20 [120] R ==> swapper/0:0 [120]","fields":{"prev_comm":"svc-4","prev_pid":20,"prev_prio":120,"prev_state":"R","next_comm":"swapper/0","next_pid":0,"next_prio":120},"hint":0}"#,
             ],
         );
 
@@ -890,9 +890,9 @@ mod tests {
             &[
                 r#"{"comm":"idle","pid":0,"tid":0,"cpu":0,"time":0.0,"event":"sched:sched_switch","trace":"swapper/0:0 [120] R ==> worker-a:10 [120]","fields":{"prev_comm":"swapper/0","prev_pid":0,"prev_prio":120,"prev_state":"R","next_comm":"worker-a","next_pid":10,"next_prio":120},"hint":0}"#,
                 r#"{"comm":"worker-a","pid":10,"tid":10,"cpu":0,"time":0.0005,"event":"sched:sched_stat_runtime","trace":"comm=worker-a runtime=500000 [ns] vruntime=0 [ns]","fields":{"comm":"worker-a","runtime":500000,"vruntime":0},"hint":640}"#,
-                r#"{"comm":"worker-a","pid":10,"tid":10,"cpu":0,"time":0.001,"event":"sched:sched_switch","trace":"worker-a:10 [120] R ==> swapper/0:0 [120]","fields":{"prev_comm":"worker-a","prev_pid":10,"prev_prio":120,"prev_state":"R","next_comm":"swapper/0","next_pid":0,"next_prio":120,"next_hint":0},"hint":640}"#,
-                r#"{"comm":"idle","pid":0,"tid":0,"cpu":0,"time":0.001,"event":"sched:sched_switch","trace":"swapper/0:0 [120] R ==> uncat:20 [120]","fields":{"prev_comm":"swapper/0","prev_pid":0,"prev_prio":120,"prev_state":"R","next_comm":"uncat","next_pid":20,"next_prio":120,"next_hint":0},"hint":0}"#,
-                r#"{"comm":"uncat","pid":20,"tid":20,"cpu":0,"time":0.002,"event":"sched:sched_switch","trace":"uncat:20 [120] R ==> swapper/0:0 [120]","fields":{"prev_comm":"uncat","prev_pid":20,"prev_prio":120,"prev_state":"R","next_comm":"swapper/0","next_pid":0,"next_prio":120,"next_hint":0},"hint":0}"#,
+                r#"{"comm":"worker-a","pid":10,"tid":10,"cpu":0,"time":0.001,"event":"sched:sched_switch","trace":"worker-a:10 [120] R ==> swapper/0:0 [120]","fields":{"prev_comm":"worker-a","prev_pid":10,"prev_prio":120,"prev_state":"R","next_comm":"swapper/0","next_pid":0,"next_prio":120},"hint":640}"#,
+                r#"{"comm":"idle","pid":0,"tid":0,"cpu":0,"time":0.001,"event":"sched:sched_switch","trace":"swapper/0:0 [120] R ==> uncat:20 [120]","fields":{"prev_comm":"swapper/0","prev_pid":0,"prev_prio":120,"prev_state":"R","next_comm":"uncat","next_pid":20,"next_prio":120},"hint":0}"#,
+                r#"{"comm":"uncat","pid":20,"tid":20,"cpu":0,"time":0.002,"event":"sched:sched_switch","trace":"uncat:20 [120] R ==> swapper/0:0 [120]","fields":{"prev_comm":"uncat","prev_pid":20,"prev_prio":120,"prev_state":"R","next_comm":"swapper/0","next_pid":0,"next_prio":120},"hint":0}"#,
             ],
         );
 

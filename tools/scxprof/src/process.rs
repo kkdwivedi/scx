@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
 #[derive(Debug, Parser)]
@@ -191,27 +191,6 @@ impl<'a> HintAnnotator<'a> {
 
     fn annotate_sched_record(&mut self, record: &mut PerfSchedScriptRecord) {
         self.annotate(record);
-
-        if record.event != "sched:sched_switch" {
-            return;
-        }
-
-        let Some(time_ns) = record.sample_time_ns else {
-            return;
-        };
-        let Some(fields) = record.fields.as_mut() else {
-            return;
-        };
-        let Some(next_pid) = fields
-            .get("next_pid")
-            .and_then(Value::as_i64)
-            .and_then(|pid| u32::try_from(pid).ok())
-        else {
-            return;
-        };
-
-        let next_hint = self.resolve_hint(next_pid, time_ns).unwrap_or(0);
-        fields.insert("next_hint".to_string(), Value::Number(Number::from(next_hint)));
     }
 
     fn resolve_hint(&mut self, tid: u32, time_ns: u64) -> Option<u64> {
@@ -549,7 +528,10 @@ fn generate_perf_script(
         bail!("perf data file '{}' not found", perf_data_path.display());
     }
 
-    let output = Command::new(perf_binary())
+    let output_file = File::create(perf_script_path)
+        .with_context(|| format!("failed to create {}", perf_script_path.display()))?;
+
+    let status = Command::new(perf_binary())
         .args([
             "script",
             "-F",
@@ -557,16 +539,14 @@ fn generate_perf_script(
             "-i",
             perf_data_path.to_str().context("invalid perf.data path")?,
         ])
-        .output()
+        .stdout(Stdio::from(output_file))
+        .stderr(Stdio::piped())
+        .status()
         .context("failed to run perf script")?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("perf script failed: {}", stderr);
+    if !status.success() {
+        bail!("perf script failed with status: {}", status);
     }
-
-    fs::write(&perf_script_path, &output.stdout)
-        .with_context(|| format!("failed to write {}", perf_script_path.display()))?;
 
     Ok(())
 }
@@ -618,6 +598,11 @@ fn parse_page_size(s: &str) -> u64 {
     }
 }
 
+fn parse_u32_pair(part: &str) -> Option<(u32, u32)> {
+    let (first, second) = part.split_once('/')?;
+    Some((first.parse().ok()?, second.parse().ok()?))
+}
+
 fn parse_perf_time_ns(s: &str) -> Option<u64> {
     let s = s.trim();
     if s.is_empty() {
@@ -659,65 +644,45 @@ fn parse_perf_mem_script_line(line: &str) -> Option<PerfMemRecord> {
         return None;
     }
 
-    let parts: Vec<&str> = line.split_whitespace().collect();
-    if parts.len() < 8 {
-        return None;
-    }
-
-    let mut tid_pid_idx = None;
-    for (i, part) in parts.iter().enumerate() {
-        if part.contains('/') {
-            let sub_parts: Vec<&str> = part.split('/').collect();
-            if sub_parts.len() == 2
-                && sub_parts[0].parse::<u32>().is_ok()
-                && sub_parts[1].parse::<u32>().is_ok()
-            {
-                tid_pid_idx = Some(i);
-                break;
-            }
+    let mut iter = line.split_whitespace();
+    let mut comm_parts = Vec::new();
+    let mut pid = None;
+    let mut tid = None;
+    for token in iter.by_ref() {
+        if let Some((parsed_pid, parsed_tid)) = parse_u32_pair(token) {
+            pid = Some(parsed_pid);
+            tid = Some(parsed_tid);
+            break;
         }
+        comm_parts.push(token);
     }
 
-    let tid_pid_idx = tid_pid_idx?;
-
-    let comm = parts[..tid_pid_idx].join(" ");
-
-    let tid_pid: Vec<&str> = parts[tid_pid_idx].split('/').collect();
-    let pid = tid_pid[0].parse::<u32>().ok()?;
-    let tid = tid_pid[1].parse::<u32>().ok()?;
-
-    let remaining = &parts[tid_pid_idx + 1..];
-
-    if remaining.len() < 4 {
-        return None;
-    }
-
-    let time = remaining[0].trim_end_matches(':').to_string();
+    let pid = pid?;
+    let tid = tid?;
+    let time = iter.next()?.trim_end_matches(':').to_string();
     let sample_time_ns = parse_perf_time_ns(&time);
-    let addr = remaining[1].to_string();
-    let cgroup = remaining[2].to_string();
-    let ip = remaining[3].to_string();
+    let addr = iter.next()?.to_string();
+    let cgroup = iter.next()?.to_string();
+    let ip = iter.next()?.to_string();
+    let remainder = iter.collect::<Vec<_>>().join(" ");
 
-    let after_ip = &remaining[4..];
-    let after_ip_str = after_ip.join(" ");
-
-    let (sym, dso, phys_addr, data_page_size) = if let Some(paren_end) = after_ip_str.rfind(')') {
-        if let Some(paren_start) = after_ip_str[..paren_end].rfind('(') {
-            let sym = after_ip_str[..paren_start].trim().to_string();
-            let dso = after_ip_str[paren_start + 1..paren_end].to_string();
-            let after_dso: Vec<&str> = after_ip_str[paren_end + 1..].split_whitespace().collect();
+    let (sym, dso, phys_addr, data_page_size) = if let Some(paren_end) = remainder.rfind(')') {
+        if let Some(paren_start) = remainder[..paren_end].rfind('(') {
+            let sym = remainder[..paren_start].trim().to_string();
+            let dso = remainder[paren_start + 1..paren_end].to_string();
+            let after_dso: Vec<&str> = remainder[paren_end + 1..].split_whitespace().collect();
             let phys_addr = after_dso.first().map(|s| s.to_string()).unwrap_or_default();
             let data_page_size = parse_page_size(after_dso.get(1).unwrap_or(&"0"));
             (sym, dso, phys_addr, data_page_size)
         } else {
-            (after_ip_str, String::new(), String::new(), 0)
+            (remainder, String::new(), String::new(), 0)
         }
     } else {
         (String::new(), String::new(), String::new(), 0)
     };
 
     Some(PerfMemRecord {
-        comm,
+        comm: comm_parts.join(" "),
         tid,
         pid,
         time,
@@ -850,7 +815,7 @@ fn parse_perf_mem_script_to_jsonl(
 ) -> Result<()> {
     let file = File::open(perf_script_path)
         .with_context(|| format!("failed to open {}", artifacts.script_kind))?;
-    let reader = BufReader::new(file);
+    let mut reader = BufReader::new(file);
 
     let output_file = File::create(output_path)
         .with_context(|| format!("failed to create {}", artifacts.jsonl_kind))?;
@@ -860,22 +825,26 @@ fn parse_perf_mem_script_to_jsonl(
     let mut skipped = 0;
     let mut errors = 0;
     let mut hint_annotator = hint_index.map(HintAnnotator::new);
-
-    for line in reader.lines() {
-        let line = line.context("failed to read line")?;
-        match parse_perf_mem_script_line(&line) {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).context("failed to read line")? == 0 {
+            break;
+        }
+        let raw_line = line.trim_end_matches(['\n', '\r']);
+        match parse_perf_mem_script_line(raw_line) {
             Some(mut record) => {
                 if record.phys_addr == "0" || record.phys_addr.is_empty() {
                     skipped += 1;
                     if verbose {
-                        eprintln!("skipped (no phys_addr): {}", line);
+                        eprintln!("skipped (no phys_addr): {}", raw_line);
                     }
                     continue;
                 }
                 if record.comm == "perf" || record.comm == "swapper" {
                     skipped += 1;
                     if verbose {
-                        eprintln!("skipped (filtered comm): {}", line);
+                        eprintln!("skipped (filtered comm): {}", raw_line);
                     }
                     continue;
                 }
@@ -887,10 +856,10 @@ fn parse_perf_mem_script_to_jsonl(
                 count += 1;
             }
             None => {
-                if !line.trim().is_empty() {
+                if !raw_line.trim().is_empty() {
                     errors += 1;
                     if verbose {
-                        eprintln!("unparseable: {}", line);
+                        eprintln!("unparseable: {}", raw_line);
                     }
                 }
             }
@@ -924,7 +893,7 @@ fn parse_sched_perf_script_to_jsonl(
 ) -> Result<()> {
     let file = File::open(perf_script_path)
         .with_context(|| format!("failed to open {}", artifacts.script_kind))?;
-    let reader = BufReader::new(file);
+    let mut reader = BufReader::new(file);
 
     let output_file = File::create(output_path)
         .with_context(|| format!("failed to create {}", artifacts.jsonl_kind))?;
@@ -933,10 +902,14 @@ fn parse_sched_perf_script_to_jsonl(
     let mut count = 0;
     let mut errors = 0;
     let mut hint_annotator = hint_index.map(HintAnnotator::new);
-
-    for line in reader.lines() {
-        let line = line.context("failed to read line")?;
-        match parse_sched_perf_script_line(&line) {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).context("failed to read line")? == 0 {
+            break;
+        }
+        let raw_line = line.trim_end_matches(['\n', '\r']);
+        match parse_sched_perf_script_line(raw_line) {
             Some(mut record) => {
                 if let Some(hint_annotator) = hint_annotator.as_mut() {
                     hint_annotator.annotate_sched_record(&mut record);
@@ -946,10 +919,10 @@ fn parse_sched_perf_script_to_jsonl(
                 count += 1;
             }
             None => {
-                if !line.trim().is_empty() {
+                if !raw_line.trim().is_empty() {
                     errors += 1;
                     if verbose {
-                        eprintln!("unparseable sched line: {}", line);
+                        eprintln!("unparseable sched line: {}", raw_line);
                     }
                 }
             }
@@ -1071,23 +1044,10 @@ mod tests {
 
         let mem_hints: Vec<u64> = mem_records.iter().map(|record| record.hint).collect();
         let sched_hints: Vec<u64> = sched_records.iter().map(|record| record.hint).collect();
-        let sched_next_hints: Vec<u64> = sched_records
-            .iter()
-            .map(|record| {
-                record
-                    .fields
-                    .as_ref()
-                    .and_then(|fields| fields.get("next_hint"))
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0)
-            })
-            .collect();
-
         assert_eq!(mem_records[0].pid, 1000);
         assert_eq!(mem_records[0].tid, 2001);
         assert_eq!(mem_hints, vec![0, 7, 7, 9, 0, 5, 5, 0]);
         assert_eq!(sched_hints, vec![0, 7, 0, 9, 0, 5, 0]);
-        assert_eq!(sched_next_hints, vec![0, 0, 7, 0, 0, 0, 0]);
 
         Ok(())
     }
