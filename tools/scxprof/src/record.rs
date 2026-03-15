@@ -51,6 +51,7 @@ pub const PERF_SCHED_DATA_FILE: &str = "perf.sched.data";
 pub const PERF_SCHED_SCRIPT_FILE: &str = "perf.sched.script";
 pub const PERF_SCHED_JSONL_FILE: &str = "perf.sched.jsonl";
 const DEFAULT_PERF_MMAP_SIZE: &str = "8M";
+const PERF_SCHED_CLOCKID: &str = "CLOCK_MONOTONIC";
 
 #[derive(Debug, Parser)]
 pub struct RecordOpts {
@@ -377,6 +378,31 @@ fn poll_fds(
     Ok(PollResult::Timeout)
 }
 
+fn build_sched_perf_args(sched_data_path: &Path) -> Vec<String> {
+    let mut sched_perf_args = vec![
+        perf_binary(),
+        "record".to_string(),
+        "-a".to_string(),
+        "-k".to_string(),
+        PERF_SCHED_CLOCKID.to_string(),
+        "-m".to_string(),
+        DEFAULT_PERF_MMAP_SIZE.to_string(),
+        "-o".to_string(),
+        sched_data_path.to_string_lossy().to_string(),
+    ];
+    for event in SCHED_TRACE_EVENTS {
+        sched_perf_args.push("-e".to_string());
+        sched_perf_args.push((*event).to_string());
+    }
+    sched_perf_args
+}
+
+fn stop_hints_recorder(hints_recorder: &mut Option<HintsRecorder<'static>>) {
+    if let Some(recorder) = hints_recorder.take() {
+        drop(recorder);
+    }
+}
+
 pub fn cmd_record(ctx: &Context, opts: RecordOpts) -> Result<()> {
     if opts.output.exists() {
         bail!(
@@ -471,19 +497,7 @@ fn run_recording(ctx: &Context, opts: &RecordOpts) -> Result<bool> {
 
     if !opts.disable_sched_trace {
         let sched_data_path = opts.output.join(PERF_SCHED_DATA_FILE);
-        let mut sched_perf_args = vec![
-            perf_binary(),
-            "record".to_string(),
-            "-a".to_string(),
-            "-m".to_string(),
-            DEFAULT_PERF_MMAP_SIZE.to_string(),
-            "-o".to_string(),
-            sched_data_path.to_string_lossy().to_string(),
-        ];
-        for event in SCHED_TRACE_EVENTS {
-            sched_perf_args.push("-e".to_string());
-            sched_perf_args.push((*event).to_string());
-        }
+        let sched_perf_args = build_sched_perf_args(&sched_data_path);
         processes.push(SpawnedProcess::spawn(&sched_perf_args)?);
     }
 
@@ -508,6 +522,12 @@ fn run_recording(ctx: &Context, opts: &RecordOpts) -> Result<bool> {
         let ringbuf_fd = hints_recorder.as_ref().map(HintsRecorder::ringbuf_fd);
         let elapsed = start.elapsed();
         if elapsed >= timeout {
+            /*
+             * Stop tracing hint updates before waiting for perf to flush and
+             * exit. Otherwise hints.jsonl keeps accumulating updates during
+             * perf teardown and no longer matches the perf capture window.
+             */
+            stop_hints_recorder(&mut hints_recorder);
             for process in &processes {
                 process.signal(libc::SIGINT);
             }
@@ -521,6 +541,7 @@ fn run_recording(ctx: &Context, opts: &RecordOpts) -> Result<bool> {
 
         match poll_fds(ctx.shutdown_fd(), &process_fds, ringbuf_fd, remaining_ms)? {
             PollResult::Shutdown => {
+                stop_hints_recorder(&mut hints_recorder);
                 for process in &processes {
                     process.signal(libc::SIGKILL);
                 }
@@ -531,6 +552,7 @@ fn run_recording(ctx: &Context, opts: &RecordOpts) -> Result<bool> {
                 break;
             }
             PollResult::ProcessExited(exited_idx) => {
+                stop_hints_recorder(&mut hints_recorder);
                 let exited_result = processes[exited_idx].wait();
                 for (idx, process) in processes.iter().enumerate() {
                     if idx != exited_idx {
@@ -597,11 +619,7 @@ fn create_archive(output_dir: &Path, archive_path: &Path) -> Result<()> {
             "-C",
             parent.to_str().context("invalid parent path")?,
             "--transform",
-            &format!(
-                "s,^{},{},",
-                dir_name.to_string_lossy(),
-                archive_root
-            ),
+            &format!("s,^{},{},", dir_name.to_string_lossy(), archive_root),
             dir_name.to_str().context("invalid directory name")?,
         ])
         .status()
@@ -629,6 +647,51 @@ fn archive_root_name(archive_path: &Path) -> Result<String> {
     }
 
     Ok(archive_root.to_string())
+}
+
+pub(crate) fn perf_script_output_exists(output_len: u64) -> bool {
+    output_len > 0
+}
+
+pub(crate) fn report_perf_script_stderr(context: &str, stderr: &str) {
+    let stderr = stderr.trim();
+    if !stderr.is_empty() {
+        eprintln!("warning: perf script reported diagnostics for {context}:\n{stderr}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sched_perf_args_use_explicit_monotonic_clock() {
+        let args = build_sched_perf_args(Path::new("/tmp/perf.sched.data"));
+
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["-k", PERF_SCHED_CLOCKID]),
+            "expected perf record args to include an explicit clockid"
+        );
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["-o", "/tmp/perf.sched.data"]),
+            "expected perf record args to include the output path"
+        );
+        for event in SCHED_TRACE_EVENTS {
+            assert!(
+                args.windows(2).any(|window| window == ["-e", *event]),
+                "missing sched trace event {event}"
+            );
+        }
+    }
+
+    #[test]
+    fn perf_script_output_exists_requires_nonempty_file() {
+        assert!(perf_script_output_exists(1));
+        assert!(perf_script_output_exists(4096));
+        assert!(!perf_script_output_exists(0));
+    }
 }
 
 /// Fields to extract from perf mem script output
@@ -660,7 +723,7 @@ fn generate_perf_script(
             perf_data_path.to_str().context("invalid perf.data path")?,
         ])
         .stdout(output_file)
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .spawn()
         .context("failed to spawn perf script")?;
 
@@ -682,11 +745,36 @@ fn generate_perf_script(
                 bail!("perf script interrupted");
             }
             PollResult::ProcessExited(_) => {
-                let status = child.wait().context("failed to wait for perf script")?;
-                if !status.success() {
+                let output = child
+                    .wait_with_output()
+                    .context("failed to wait for perf script")?;
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let output_len = fs::metadata(perf_script_path)
+                    .map(|meta| meta.len())
+                    .unwrap_or(0);
+                if !output.status.success() {
+                    if perf_script_output_exists(output_len) {
+                        eprintln!(
+                            "warning: perf script exited with status {} after writing {} bytes to {}. Continuing with the generated output because the output file is non-empty.",
+                            output.status,
+                            output_len,
+                            perf_script_path.display()
+                        );
+                        report_perf_script_stderr(&perf_script_path.display().to_string(), &stderr);
+                        break;
+                    }
                     let _ = fs::remove_file(&perf_script_path);
-                    bail!("perf script failed with status: {}", status);
+                    let stderr = stderr.trim();
+                    if stderr.is_empty() {
+                        bail!("perf script failed with status: {}", output.status);
+                    }
+                    bail!(
+                        "perf script failed with status: {}: {}",
+                        output.status,
+                        stderr
+                    );
                 }
+                report_perf_script_stderr(&perf_script_path.display().to_string(), &stderr);
                 break;
             }
             PollResult::RingbufReady | PollResult::Timeout => {}

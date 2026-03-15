@@ -4,9 +4,9 @@
 // GNU General Public License version 2.
 
 use crate::record::{
-    perf_binary, PERF_MEM_DATA_FILE, PERF_MEM_JSONL_FILE, PERF_MEM_SCRIPT_FIELDS,
-    PERF_MEM_SCRIPT_FILE, PERF_SCHED_DATA_FILE, PERF_SCHED_JSONL_FILE, PERF_SCHED_SCRIPT_FIELDS,
-    PERF_SCHED_SCRIPT_FILE,
+    perf_binary, perf_script_output_exists, report_perf_script_stderr,
+    PERF_MEM_DATA_FILE, PERF_MEM_JSONL_FILE, PERF_MEM_SCRIPT_FIELDS, PERF_MEM_SCRIPT_FILE,
+    PERF_SCHED_DATA_FILE, PERF_SCHED_JSONL_FILE, PERF_SCHED_SCRIPT_FIELDS, PERF_SCHED_SCRIPT_FILE,
 };
 use anyhow::{bail, Context as _, Result};
 use clap::Parser;
@@ -191,6 +191,33 @@ impl<'a> HintAnnotator<'a> {
 
     fn annotate_sched_record(&mut self, record: &mut PerfSchedScriptRecord) {
         self.annotate(record);
+
+        if record.event != "sched:sched_switch" {
+            return;
+        }
+
+        let Some(time_ns) = record.hint_time_ns() else {
+            return;
+        };
+        let Some(fields) = record.fields.as_mut() else {
+            return;
+        };
+
+        fields.insert(
+            "prev_hint".to_string(),
+            Value::Number(Number::from(record.hint)),
+        );
+
+        let next_hint = fields
+            .get("next_pid")
+            .and_then(Value::as_i64)
+            .and_then(|tid| u32::try_from(tid).ok())
+            .and_then(|tid| self.resolve_hint(tid, time_ns))
+            .unwrap_or(0);
+        fields.insert(
+            "next_hint".to_string(),
+            Value::Number(Number::from(next_hint)),
+        );
     }
 
     fn resolve_hint(&mut self, tid: u32, time_ns: u64) -> Option<u64> {
@@ -354,7 +381,10 @@ fn run_processing(profile_dir: &Path, output_dir: &Path, verbose: bool) -> Resul
             );
         }
     }
-    if let Some(mem_perf_script_dst) = prepare_trace_script_if_present(profile_dir, output_dir, mem_trace)? {
+    copy_hints_if_present(profile_dir, output_dir)?;
+    if let Some(mem_perf_script_dst) =
+        prepare_trace_script_if_present(profile_dir, output_dir, mem_trace)?
+    {
         parse_perf_mem_script_to_jsonl(
             &mem_perf_script_dst,
             &output_dir.join(mem_trace.jsonl_file),
@@ -377,6 +407,23 @@ fn run_processing(profile_dir: &Path, output_dir: &Path, verbose: bool) -> Resul
     }
 
     print_profile_contents(output_dir)?;
+    Ok(())
+}
+
+fn copy_hints_if_present(profile_dir: &Path, output_dir: &Path) -> Result<()> {
+    let hints_src = profile_dir.join("hints.jsonl");
+    if !hints_src.exists() {
+        return Ok(());
+    }
+
+    let hints_dst = output_dir.join("hints.jsonl");
+    fs::copy(&hints_src, &hints_dst).with_context(|| {
+        format!(
+            "failed to copy hints.jsonl from '{}' to '{}'",
+            hints_src.display(),
+            hints_dst.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -483,7 +530,10 @@ fn validate_archive_layout(archive_path: &Path) -> Result<()> {
         .to_string();
 
     let output = Command::new("tar")
-        .args(["-tzf", archive_path.to_str().context("invalid archive path")?])
+        .args([
+            "-tzf",
+            archive_path.to_str().context("invalid archive path")?,
+        ])
         .output()
         .context("failed to inspect tar archive")?;
 
@@ -531,7 +581,7 @@ fn generate_perf_script(
     let output_file = File::create(perf_script_path)
         .with_context(|| format!("failed to create {}", perf_script_path.display()))?;
 
-    let status = Command::new(perf_binary())
+    let output = Command::new(perf_binary())
         .args([
             "script",
             "-F",
@@ -541,12 +591,40 @@ fn generate_perf_script(
         ])
         .stdout(Stdio::from(output_file))
         .stderr(Stdio::piped())
-        .status()
+        .spawn()
+        .context("failed to run perf script")?
+        .wait_with_output()
         .context("failed to run perf script")?;
 
-    if !status.success() {
-        bail!("perf script failed with status: {}", status);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let output_len = fs::metadata(perf_script_path)
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+
+    if !output.status.success() {
+        if perf_script_output_exists(output_len) {
+            eprintln!(
+                "warning: perf script exited with status {} after writing {} bytes to {}. Continuing with the generated output because the output file is non-empty.",
+                output.status,
+                output_len,
+                perf_script_path.display()
+            );
+            report_perf_script_stderr(&perf_script_path.display().to_string(), &stderr);
+            return Ok(());
+        }
+        let _ = fs::remove_file(perf_script_path);
+        let stderr = stderr.trim();
+        if stderr.is_empty() {
+            bail!("perf script failed with status: {}", output.status);
+        }
+        bail!(
+            "perf script failed with status: {}: {}",
+            output.status,
+            stderr
+        );
     }
+
+    report_perf_script_stderr(&perf_script_path.display().to_string(), &stderr);
 
     Ok(())
 }
@@ -1042,12 +1120,88 @@ mod tests {
         let sched_records: Vec<PerfSchedScriptRecord> =
             read_jsonl(&output_dir.join(PERF_SCHED_JSONL_FILE))?;
 
+        assert!(output_dir.join("hints.jsonl").exists());
+
         let mem_hints: Vec<u64> = mem_records.iter().map(|record| record.hint).collect();
         let sched_hints: Vec<u64> = sched_records.iter().map(|record| record.hint).collect();
         assert_eq!(mem_records[0].pid, 1000);
         assert_eq!(mem_records[0].tid, 2001);
         assert_eq!(mem_hints, vec![0, 7, 7, 9, 0, 5, 5, 0]);
         assert_eq!(sched_hints, vec![0, 7, 0, 9, 0, 5, 0]);
+        assert_eq!(
+            sched_records[2]
+                .fields
+                .as_ref()
+                .and_then(|fields| fields.get("next_hint"))
+                .and_then(Value::as_u64),
+            Some(7)
+        );
+        assert_eq!(
+            sched_records[2]
+                .fields
+                .as_ref()
+                .and_then(|fields| fields.get("prev_hint"))
+                .and_then(Value::as_u64),
+            Some(0)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn process_annotates_sched_switch_prev_and_next_hints_independently() -> Result<()> {
+        let mut timelines = HashMap::new();
+        timelines.insert(
+            10,
+            ThreadHintTimeline {
+                records: vec![HintRecord {
+                    pid: 10,
+                    tgid: 1000,
+                    hints: 256,
+                    timestamp: 500,
+                }],
+            },
+        );
+        timelines.insert(
+            20,
+            ThreadHintTimeline {
+                records: vec![HintRecord {
+                    pid: 20,
+                    tgid: 1000,
+                    hints: 640,
+                    timestamp: 500,
+                }],
+            },
+        );
+        let hint_index = HintIndex {
+            timelines,
+            ordering_issues: None,
+        };
+        let mut annotator = HintAnnotator::new(&hint_index);
+        let mut record = parse_sched_perf_script_line(
+            "worker-a 1000/10 [000] 0.000000500: sched:sched_switch: worker-a:10 [120] R ==> worker-b:20 [120]",
+        )
+        .expect("expected sched record");
+
+        annotator.annotate_sched_record(&mut record);
+
+        assert_eq!(record.hint, 256);
+        assert_eq!(
+            record
+                .fields
+                .as_ref()
+                .and_then(|fields| fields.get("prev_hint"))
+                .and_then(Value::as_u64),
+            Some(256)
+        );
+        assert_eq!(
+            record
+                .fields
+                .as_ref()
+                .and_then(|fields| fields.get("next_hint"))
+                .and_then(Value::as_u64),
+            Some(640)
+        );
 
         Ok(())
     }
@@ -1055,8 +1209,8 @@ mod tests {
     #[test]
     fn hint_annotation_handles_out_of_order_hints_and_samples_conservatively() -> Result<()> {
         let (_tempdir, profile_dir) = materialize_test_profile("profile_out_of_order")?;
-        let hint_index = HintIndex::load_if_exists(&profile_dir)?
-            .expect("expected hints index to be loaded");
+        let hint_index =
+            HintIndex::load_if_exists(&profile_dir)?.expect("expected hints index to be loaded");
 
         assert!(hint_index.ordering_issues.is_some());
 

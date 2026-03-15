@@ -129,6 +129,7 @@ impl ActiveExecution {
 #[derive(Debug, Default)]
 struct CpuState {
     segment_start_ns: u64,
+    last_seen_ns: u64,
     running_task: Option<RunningTask>,
     system_stack: Vec<ActiveSystem>,
     active_execution: Option<ActiveExecution>,
@@ -138,6 +139,7 @@ struct CpuState {
 enum ClassifiedEvent {
     SchedSwitch {
         next_comm: String,
+        next_hint: u64,
         next_tid: i32,
         next_is_idle: bool,
     },
@@ -244,11 +246,7 @@ impl BucketAggregator {
                 window_ms,
                 cpu_count,
                 total: self.total_busy_ns.get(idx).copied().unwrap_or(0) as f64 * scale,
-                uncategorized: self
-                    .uncategorized_busy_ns
-                    .get(idx)
-                    .copied()
-                    .unwrap_or(0) as f64
+                uncategorized: self.uncategorized_busy_ns.get(idx).copied().unwrap_or(0) as f64
                     * scale,
                 categories: categories_json,
             });
@@ -346,16 +344,24 @@ impl<S: BusyIntervalSink> SchedBusyTracker<S> {
     }
 
     fn process_record(&mut self, record: PerfSchedScriptRecord) {
-        let Some(time_ns) = record.sample_time_ns().or_else(|| sched_time_to_ns(record.time)) else {
+        let Some(time_ns) = record
+            .sample_time_ns()
+            .or_else(|| sched_time_to_ns(record.time))
+        else {
             return;
         };
 
         let mut emitted = Vec::new();
         {
-            let state = self.cpu_states.entry(record.cpu).or_insert_with(|| CpuState {
-                segment_start_ns: time_ns,
-                ..CpuState::default()
-            });
+            let state = self
+                .cpu_states
+                .entry(record.cpu)
+                .or_insert_with(|| CpuState {
+                    segment_start_ns: time_ns,
+                    last_seen_ns: time_ns,
+                    ..CpuState::default()
+                });
+            state.last_seen_ns = time_ns;
 
             if let Some(task) = state.running_task.as_mut() {
                 if record.tid == task.tid && record.hint != task.hint {
@@ -369,6 +375,7 @@ impl<S: BusyIntervalSink> SchedBusyTracker<S> {
             match classify_event(&record) {
                 ClassifiedEvent::SchedSwitch {
                     next_comm,
+                    next_hint,
                     next_tid,
                     next_is_idle,
                 } => {
@@ -378,7 +385,7 @@ impl<S: BusyIntervalSink> SchedBusyTracker<S> {
                         state.running_task = Some(RunningTask {
                             tid: next_tid,
                             comm: next_comm,
-                            hint: 0,
+                            hint: next_hint,
                         });
                     }
                     if let Some(interval) = sync_cpu_state(state, time_ns) {
@@ -431,9 +438,10 @@ impl<S: BusyIntervalSink> SchedBusyTracker<S> {
         }
     }
 
-    fn finish(mut self, trace_end_ns: u64) -> S {
+    fn finish(mut self, _trace_end_ns: u64) -> S {
         for state in self.cpu_states.values_mut() {
-            if let Some(interval) = flush_current_interval(state, trace_end_ns) {
+            let cpu_end_ns = state.last_seen_ns.max(state.segment_start_ns);
+            if let Some(interval) = flush_current_interval(state, cpu_end_ns) {
                 self.sink.on_interval(&interval);
             }
         }
@@ -496,7 +504,11 @@ fn sync_cpu_state(state: &mut CpuState, time_ns: u64) -> Option<BusyInterval> {
 }
 
 fn pop_system_override(state: &mut CpuState, system: ActiveSystem) {
-    if let Some(pos) = state.system_stack.iter().rposition(|value| *value == system) {
+    if let Some(pos) = state
+        .system_stack
+        .iter()
+        .rposition(|value| *value == system)
+    {
         state.system_stack.remove(pos);
     }
 }
@@ -579,7 +591,11 @@ fn compile_category_matcher(categories: &[CategorySpec]) -> CompiledCategoryMatc
                         .or_default()
                         .push(index);
                 } else {
-                    matcher.exact_any_hint.entry(comm.clone()).or_default().push(index);
+                    matcher
+                        .exact_any_hint
+                        .entry(comm.clone())
+                        .or_default()
+                        .push(index);
                 }
             }
             CategoryCommMatcher::Glob(pattern) => matcher.glob_specs.push(GlobCategory {
@@ -632,6 +648,7 @@ fn classify_event(record: &PerfSchedScriptRecord) -> ClassifiedEvent {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
+            let next_hint = fields.get("next_hint").and_then(Value::as_u64).unwrap_or(0);
             let next_tid = fields
                 .get("next_pid")
                 .and_then(Value::as_i64)
@@ -640,6 +657,7 @@ fn classify_event(record: &PerfSchedScriptRecord) -> ClassifiedEvent {
             ClassifiedEvent::SchedSwitch {
                 next_is_idle: sched_switch_next_is_idle(fields),
                 next_comm,
+                next_hint,
                 next_tid,
             }
         }
@@ -757,7 +775,10 @@ pub fn cmd_extract_sched_util(opts: ExtractSchedUtilOpts) -> Result<()> {
 
         let record: PerfSchedScriptRecord =
             serde_json::from_str(&line).context("failed to parse perf.sched.jsonl record")?;
-        let Some(time_ns) = record.sample_time_ns().or_else(|| sched_time_to_ns(record.time)) else {
+        let Some(time_ns) = record
+            .sample_time_ns()
+            .or_else(|| sched_time_to_ns(record.time))
+        else {
             continue;
         };
 
@@ -808,7 +829,10 @@ fn build_busy_intervals(
     let mut tracker = SchedBusyTracker::new(VecIntervalSink::default());
 
     for record in records {
-        let Some(time_ns) = record.sample_time_ns().or_else(|| sched_time_to_ns(record.time)) else {
+        let Some(time_ns) = record
+            .sample_time_ns()
+            .or_else(|| sched_time_to_ns(record.time))
+        else {
             continue;
         };
         stats.observe(&record, time_ns);
@@ -914,7 +938,10 @@ mod tests {
         for line in reader.lines() {
             let line = line?;
             let record: PerfSchedScriptRecord = serde_json::from_str(&line)?;
-            let Some(time_ns) = record.sample_time_ns().or_else(|| sched_time_to_ns(record.time)) else {
+            let Some(time_ns) = record
+                .sample_time_ns()
+                .or_else(|| sched_time_to_ns(record.time))
+            else {
                 continue;
             };
             if stats.trace_start_ns.is_none() {
@@ -972,19 +999,110 @@ mod tests {
 
         assert_eq!(intervals[1].comm, "worker-a");
         assert_eq!(intervals[1].hint, 384);
-        assert_eq!((intervals[1].start_ns, intervals[1].end_ns), (200_000, 600_000));
+        assert_eq!(
+            (intervals[1].start_ns, intervals[1].end_ns),
+            (200_000, 600_000)
+        );
 
         assert_eq!(intervals[2].comm, "softirq-rx");
         assert_eq!(intervals[2].hint, 0);
-        assert_eq!((intervals[2].start_ns, intervals[2].end_ns), (600_000, 700_000));
+        assert_eq!(
+            (intervals[2].start_ns, intervals[2].end_ns),
+            (600_000, 700_000)
+        );
 
         assert_eq!(intervals[3].comm, "worker-a");
         assert_eq!(intervals[3].hint, 384);
-        assert_eq!((intervals[3].start_ns, intervals[3].end_ns), (700_000, 800_000));
+        assert_eq!(
+            (intervals[3].start_ns, intervals[3].end_ns),
+            (700_000, 800_000)
+        );
 
         assert_eq!(intervals[4].comm, "worker-a");
         assert_eq!(intervals[4].hint, 640);
-        assert_eq!((intervals[4].start_ns, intervals[4].end_ns), (800_000, 1_000_000));
+        assert_eq!(
+            (intervals[4].start_ns, intervals[4].end_ns),
+            (800_000, 1_000_000)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn sched_util_uses_next_hint_from_switch_for_immediate_on_cpu_time() -> Result<()> {
+        let tempdir = TempDir::new()?;
+        let path = write_sched_jsonl(
+            &tempdir,
+            &[
+                r#"{"comm":"idle","pid":0,"tid":0,"cpu":0,"time":0.0,"event":"sched:sched_switch","trace":"swapper/0:0 [120] R ==> worker-a:10 [120]","fields":{"prev_comm":"swapper/0","prev_pid":0,"prev_prio":120,"prev_state":"R","prev_hint":0,"next_comm":"worker-a","next_pid":10,"next_prio":120,"next_hint":640},"hint":0}"#,
+                r#"{"comm":"worker-a","pid":10,"tid":10,"cpu":0,"time":0.001,"event":"sched:sched_switch","trace":"worker-a:10 [120] R ==> swapper/0:0 [120]","fields":{"prev_comm":"worker-a","prev_pid":10,"prev_prio":120,"prev_state":"R","prev_hint":640,"next_comm":"swapper/0","next_pid":0,"next_prio":120,"next_hint":0},"hint":640}"#,
+            ],
+        );
+
+        let file = File::open(&path)?;
+        let reader = BufReader::new(file);
+        let records: Vec<PerfSchedScriptRecord> = reader
+            .lines()
+            .map(|line| -> Result<_> {
+                let line = line?;
+                Ok(serde_json::from_str(&line)?)
+            })
+            .collect::<Result<_>>()?;
+
+        let (intervals, _start_ns, _end_ns, cpu_count) = build_busy_intervals(records)?;
+        assert_eq!(cpu_count, 1);
+        assert_eq!(intervals.len(), 1);
+        assert_eq!(intervals[0].comm, "worker-a");
+        assert_eq!(intervals[0].hint, 640);
+        assert_eq!((intervals[0].start_ns, intervals[0].end_ns), (0, 1_000_000));
+
+        Ok(())
+    }
+
+    #[test]
+    fn sched_util_does_not_extrapolate_last_running_task_to_global_trace_end() -> Result<()> {
+        let tempdir = TempDir::new()?;
+        let path = write_sched_jsonl(
+            &tempdir,
+            &[
+                r#"{"comm":"idle","pid":0,"tid":0,"cpu":0,"time":0.0,"event":"sched:sched_switch","trace":"swapper/0:0 [120] R ==> perf:900 [120]","fields":{"prev_comm":"swapper/0","prev_pid":0,"prev_prio":120,"prev_state":"R","next_comm":"perf","next_pid":900,"next_prio":120},"hint":0}"#,
+                r#"{"comm":"perf","pid":900,"tid":900,"cpu":0,"time":0.001,"event":"sched:sched_stat_runtime","trace":"comm=perf runtime=1000000 [ns] vruntime=0 [ns]","fields":{"comm":"perf","runtime":1000000,"vruntime":0},"hint":0}"#,
+                r#"{"comm":"idle","pid":0,"tid":0,"cpu":1,"time":0.0,"event":"sched:sched_switch","trace":"swapper/1:0 [120] R ==> worker-a:10 [120]","fields":{"prev_comm":"swapper/1","prev_pid":0,"prev_prio":120,"prev_state":"R","next_comm":"worker-a","next_pid":10,"next_prio":120},"hint":0}"#,
+                r#"{"comm":"worker-a","pid":10,"tid":10,"cpu":1,"time":0.002,"event":"sched:sched_switch","trace":"worker-a:10 [120] R ==> swapper/1:0 [120]","fields":{"prev_comm":"worker-a","prev_pid":10,"prev_prio":120,"prev_state":"R","next_comm":"swapper/1","next_pid":0,"next_prio":120},"hint":0}"#,
+            ],
+        );
+
+        let file = File::open(&path)?;
+        let reader = BufReader::new(file);
+        let records: Vec<PerfSchedScriptRecord> = reader
+            .lines()
+            .map(|line| -> Result<_> {
+                let line = line?;
+                Ok(serde_json::from_str(&line)?)
+            })
+            .collect::<Result<_>>()?;
+
+        let (intervals, _start_ns, end_ns, cpu_count) = build_busy_intervals(records)?;
+        assert_eq!(cpu_count, 2);
+        assert_eq!(end_ns, 2_000_000);
+
+        let perf_interval = intervals
+            .iter()
+            .find(|interval| interval.comm == "perf")
+            .expect("expected perf interval");
+        assert_eq!(
+            (perf_interval.start_ns, perf_interval.end_ns),
+            (0, 1_000_000)
+        );
+
+        let worker_interval = intervals
+            .iter()
+            .find(|interval| interval.comm == "worker-a")
+            .expect("expected worker interval");
+        assert_eq!(
+            (worker_interval.start_ns, worker_interval.end_ns),
+            (0, 2_000_000)
+        );
 
         Ok(())
     }
