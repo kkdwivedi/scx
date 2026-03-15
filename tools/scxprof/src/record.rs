@@ -75,7 +75,7 @@ pub struct RecordOpts {
     pub hints_map: Option<PathBuf>,
 
     /// Size of the hints ring buffer in MB
-    #[clap(long, default_value = "1")]
+    #[clap(long, default_value = "8")]
     pub hints_map_ring_sz: u32,
 
     /// Disable creating a tar.gz archive after recording
