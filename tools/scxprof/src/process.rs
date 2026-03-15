@@ -375,19 +375,19 @@ fn run_processing(profile_dir: &Path, output_dir: &Path, verbose: bool) -> Resul
             );
         }
     }
-    let mem_perf_script_dst = prepare_trace_script(profile_dir, output_dir, mem_trace)?;
-    parse_perf_mem_script_to_jsonl(
-        &mem_perf_script_dst,
-        &output_dir.join(mem_trace.jsonl_file),
-        hint_index.as_ref(),
-        mem_trace,
-        verbose,
-    )?;
+    if let Some(mem_perf_script_dst) = prepare_trace_script_if_present(profile_dir, output_dir, mem_trace)? {
+        parse_perf_mem_script_to_jsonl(
+            &mem_perf_script_dst,
+            &output_dir.join(mem_trace.jsonl_file),
+            hint_index.as_ref(),
+            mem_trace,
+            verbose,
+        )?;
+    }
 
-    if profile_dir.join(sched_trace.script_file).exists()
-        || profile_dir.join(sched_trace.data_file).exists()
+    if let Some(sched_perf_script_dst) =
+        prepare_trace_script_if_present(profile_dir, output_dir, sched_trace)?
     {
-        let sched_perf_script_dst = prepare_trace_script(profile_dir, output_dir, sched_trace)?;
         parse_sched_perf_script_to_jsonl(
             &sched_perf_script_dst,
             &output_dir.join(sched_trace.jsonl_file),
@@ -401,14 +401,22 @@ fn run_processing(profile_dir: &Path, output_dir: &Path, verbose: bool) -> Resul
     Ok(())
 }
 
-fn prepare_trace_script(
+fn prepare_trace_script_if_present(
     profile_dir: &Path,
     output_dir: &Path,
     artifacts: TraceArtifacts<'_>,
-) -> Result<PathBuf> {
+) -> Result<Option<PathBuf>> {
     let perf_data_src = profile_dir.join(artifacts.data_file);
     let perf_script_src = profile_dir.join(artifacts.script_file);
     let perf_script_dst = output_dir.join(artifacts.script_file);
+
+    if !perf_script_src.exists() && !perf_data_src.exists() {
+        println!(
+            "Skipping {}: neither {} nor {} is present",
+            artifacts.jsonl_kind, artifacts.script_file, artifacts.data_file
+        );
+        return Ok(None);
+    }
 
     if !perf_script_src.exists() {
         println!(
@@ -422,7 +430,7 @@ fn prepare_trace_script(
     fs::copy(&perf_script_src, &perf_script_dst)
         .with_context(|| format!("failed to copy {}", artifacts.script_kind))?;
 
-    Ok(perf_script_dst)
+    Ok(Some(perf_script_dst))
 }
 
 fn prepare_profile_dir(path: &Path) -> Result<PathBuf> {
