@@ -69,6 +69,12 @@ pub struct PerfSchedScriptRecord {
     sample_time_ns: Option<u64>,
 }
 
+impl PerfSchedScriptRecord {
+    pub fn sample_time_ns(&self) -> Option<u64> {
+        self.sample_time_ns
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct HintRecord {
     pid: i32,
@@ -181,6 +187,31 @@ impl<'a> HintAnnotator<'a> {
             .and_then(|(tid, time_ns)| self.resolve_hint(tid, time_ns))
             .unwrap_or(0);
         record.set_hint(hint);
+    }
+
+    fn annotate_sched_record(&mut self, record: &mut PerfSchedScriptRecord) {
+        self.annotate(record);
+
+        if record.event != "sched:sched_switch" {
+            return;
+        }
+
+        let Some(time_ns) = record.sample_time_ns else {
+            return;
+        };
+        let Some(fields) = record.fields.as_mut() else {
+            return;
+        };
+        let Some(next_pid) = fields
+            .get("next_pid")
+            .and_then(Value::as_i64)
+            .and_then(|pid| u32::try_from(pid).ok())
+        else {
+            return;
+        };
+
+        let next_hint = self.resolve_hint(next_pid, time_ns).unwrap_or(0);
+        fields.insert("next_hint".to_string(), Value::Number(Number::from(next_hint)));
     }
 
     fn resolve_hint(&mut self, tid: u32, time_ns: u64) -> Option<u64> {
@@ -900,7 +931,7 @@ fn parse_sched_perf_script_to_jsonl(
         match parse_sched_perf_script_line(&line) {
             Some(mut record) => {
                 if let Some(hint_annotator) = hint_annotator.as_mut() {
-                    hint_annotator.annotate(&mut record);
+                    hint_annotator.annotate_sched_record(&mut record);
                 }
                 let json = serde_json::to_string(&record).context("failed to serialize record")?;
                 writeln!(writer, "{}", json)?;
@@ -1032,11 +1063,23 @@ mod tests {
 
         let mem_hints: Vec<u64> = mem_records.iter().map(|record| record.hint).collect();
         let sched_hints: Vec<u64> = sched_records.iter().map(|record| record.hint).collect();
+        let sched_next_hints: Vec<u64> = sched_records
+            .iter()
+            .map(|record| {
+                record
+                    .fields
+                    .as_ref()
+                    .and_then(|fields| fields.get("next_hint"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+            })
+            .collect();
 
         assert_eq!(mem_records[0].pid, 1000);
         assert_eq!(mem_records[0].tid, 2001);
         assert_eq!(mem_hints, vec![0, 7, 7, 9, 0, 5, 5, 0]);
-        assert_eq!(sched_hints, vec![0, 7, 9, 0, 5, 0]);
+        assert_eq!(sched_hints, vec![0, 7, 0, 9, 0, 5, 0]);
+        assert_eq!(sched_next_hints, vec![0, 0, 7, 0, 0, 0, 0]);
 
         Ok(())
     }

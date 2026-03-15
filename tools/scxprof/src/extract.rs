@@ -4,8 +4,9 @@
 // GNU General Public License version 2.
 
 use crate::process::PerfMemRecord;
+use crate::sched_util::cmd_extract_sched_util;
 use anyhow::{Context as _, Result};
-use clap::{ArgAction, Parser};
+use clap::{ArgAction, Parser, Subcommand};
 use regex::Regex;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -17,7 +18,7 @@ const DEFAULT_WORKLOAD_CGROUP_REGEX: &str = "workload.slice";
 const DEFAULT_WORKLOAD_ALLOTMENT_CGROUP_REGEX: &str = r"workload-tw-[^/]+\.allotment\.slice";
 
 #[derive(Debug, Parser)]
-pub struct ExtractOpts {
+pub struct ExtractMemOpts {
     /// Path to perf.mem.jsonl file
     #[clap(short = 'f', long)]
     pub file: PathBuf,
@@ -33,6 +34,51 @@ pub struct ExtractOpts {
     /// Verbosity level (-v for summary, -vv for detailed output)
     #[clap(short, long, action = ArgAction::Count)]
     pub verbose: u8,
+}
+
+#[derive(Debug, Parser)]
+pub struct ExtractOpts {
+    #[clap(subcommand)]
+    pub command: ExtractCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ExtractCommand {
+    /// Extract workload cell config from perf.mem.jsonl
+    Mem(ExtractMemOpts),
+    /// Extract derived metrics from perf.sched.jsonl
+    Sched(ExtractSchedOpts),
+}
+
+#[derive(Debug, Parser)]
+pub struct ExtractSchedOpts {
+    #[clap(subcommand)]
+    pub command: ExtractSchedCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ExtractSchedCommand {
+    /// Compute time-weighted CPU busy utilization from perf.sched.jsonl
+    Util(ExtractSchedUtilOpts),
+}
+
+#[derive(Debug, Parser)]
+pub struct ExtractSchedUtilOpts {
+    /// Path to perf.sched.jsonl file
+    #[clap(short = 'f', long)]
+    pub file: PathBuf,
+
+    /// Aggregation window size in milliseconds
+    #[clap(long, default_value = "1")]
+    pub window_ms: u64,
+
+    /// Comma-separated categories, e.g. "worker-a,svc-*,perf,worker-a@hint=640"
+    #[clap(long, default_value = "")]
+    pub categories: String,
+
+    /// Print extra summary information to stderr
+    #[clap(short, long)]
+    pub verbose: bool,
 }
 
 fn classify_cgroup<'a>(cgroup: &'a str, workload_cgroup: &'a str, allotment_re: &Regex) -> &'a str {
@@ -199,7 +245,7 @@ struct CellConfig {
     specs: Vec<CellSpec>,
 }
 
-pub fn cmd_extract(opts: ExtractOpts) -> Result<()> {
+pub fn cmd_extract_mem(opts: ExtractMemOpts) -> Result<()> {
     let file = File::open(&opts.file).context("failed to open perf.mem.jsonl")?;
     let reader = BufReader::new(file);
 
@@ -258,6 +304,19 @@ pub fn cmd_extract(opts: ExtractOpts) -> Result<()> {
     Ok(())
 }
 
+pub fn cmd_extract(opts: ExtractOpts) -> Result<()> {
+    match opts.command {
+        ExtractCommand::Mem(opts) => cmd_extract_mem(opts),
+        ExtractCommand::Sched(opts) => cmd_extract_sched(opts),
+    }
+}
+
+pub fn cmd_extract_sched(opts: ExtractSchedOpts) -> Result<()> {
+    match opts.command {
+        ExtractSchedCommand::Util(opts) => cmd_extract_sched_util(opts),
+    }
+}
+
 fn generate_config(
     groups: &HashMap<String, GroupData>,
     group_names: &[String],
@@ -266,7 +325,6 @@ fn generate_config(
 ) -> CellConfig {
     let mut specs = Vec::new();
 
-    // Process each group type uniformly
     let group_types = [
         (GroupType::Allotment, "allotment"),
         (GroupType::Workload, workload_cgroup),
@@ -274,7 +332,6 @@ fn generate_config(
     ];
 
     for (group_type, name) in group_types {
-        // Collect samples for this group type
         let samples: Vec<&PerfMemRecord> = match group_type {
             GroupType::Allotment => group_names
                 .iter()
@@ -296,11 +353,9 @@ fn generate_config(
             continue;
         }
 
-        // Compute clusters
         let clusters = compute_clusters(group_type, &samples, 5.0);
         let subcells = build_subcells_from_clusters(&clusters);
 
-        // Build cell match based on group type
         let (cell_match, matches) = match group_type {
             GroupType::Allotment => (
                 Some(CellMatch::CgroupRegex(allotment_regex.to_string())),
