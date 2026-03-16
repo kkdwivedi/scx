@@ -72,7 +72,7 @@ pub struct ExtractSchedUtilOpts {
     #[clap(long, default_value = "1")]
     pub window_ms: u64,
 
-    /// Comma-separated categories, e.g. "worker-a,svc-*,perf,worker-a@hint=640"
+    /// Comma-separated mutually exclusive categories, e.g. "worker-a@hint=0,worker-a@hint=640,svc-*,perf"
     #[clap(long, default_value = "")]
     pub categories: String,
 

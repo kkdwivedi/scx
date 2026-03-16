@@ -54,6 +54,9 @@ const DEFAULT_PERF_MMAP_SIZE: &str = "8M";
 const PERF_SCHED_CLOCKID: &str = "CLOCK_MONOTONIC";
 
 #[derive(Debug, Parser)]
+#[command(
+    after_help = "Trace cost notes:\n  hints trace < mem trace < sched trace\n\n  sched trace produces a much higher volume of data than hints or mem trace and can be quite costly. On some workloads it can materially perturb the host, especially for longer recordings or when writing to slower / write-amplifying filesystems. Prefer shorter durations when sched trace is enabled."
+)]
 pub struct RecordOpts {
     /// Output directory for recording
     #[clap(short, long, default_value = "scxprof.out")]
