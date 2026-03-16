@@ -226,6 +226,40 @@ impl BucketAggregator {
                 100.0 / capacity_ns as f64
             };
 
+            let total_busy_ns = self.total_busy_ns.get(idx).copied().unwrap_or(0);
+            let uncategorized_busy_ns = self.uncategorized_busy_ns.get(idx).copied().unwrap_or(0);
+            let categorized_busy_ns: u64 = self
+                .category_busy_ns
+                .iter()
+                .map(|values| values.get(idx).copied().unwrap_or(0))
+                .sum();
+
+            if categorized_busy_ns + uncategorized_busy_ns != total_busy_ns {
+                let category_totals: Vec<_> = self
+                    .categories
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx_cat, category)| {
+                        let value = self
+                            .category_busy_ns
+                            .get(idx_cat)
+                            .and_then(|values| values.get(idx))
+                            .copied()
+                            .unwrap_or(0);
+                        (value > 0).then_some(format!("{}={}ns", category.name, value))
+                    })
+                    .collect();
+
+                anyhow::bail!(
+                    "sched util categories are not mutually exclusive in bucket starting at {}ms: total={}ns uncategorized={}ns categorized_sum={}ns [{}]. Fix --categories so each busy interval matches at most one category",
+                    (bucket_start_ns - self.trace_start_ns) / 1_000_000,
+                    total_busy_ns,
+                    uncategorized_busy_ns,
+                    categorized_busy_ns,
+                    category_totals.join(", "),
+                );
+            }
+
             let categories_json = self
                 .categories
                 .iter()
@@ -245,9 +279,8 @@ impl BucketAggregator {
                 time_ms: (bucket_start_ns - self.trace_start_ns) / 1_000_000,
                 window_ms,
                 cpu_count,
-                total: self.total_busy_ns.get(idx).copied().unwrap_or(0) as f64 * scale,
-                uncategorized: self.uncategorized_busy_ns.get(idx).copied().unwrap_or(0) as f64
-                    * scale,
+                total: total_busy_ns as f64 * scale,
+                uncategorized: uncategorized_busy_ns as f64 * scale,
                 categories: categories_json,
             });
         }
@@ -1036,6 +1069,60 @@ mod tests {
         assert_eq!(output[0].categories["worker-a@hint=0"], 50.0);
         assert_eq!(output[0].categories["worker-a@hint=640"], 50.0);
         assert_eq!(output[1].uncategorized, 100.0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn sched_util_rejects_overlapping_categories() -> Result<()> {
+        let tempdir = TempDir::new()?;
+        let path = write_sched_jsonl(
+            &tempdir,
+            &[
+                r#"{"comm":"idle","pid":0,"tid":0,"cpu":0,"time":0.0,"event":"sched:sched_switch","trace":"swapper/0:0 [120] R ==> worker-a:10 [120]","fields":{"prev_comm":"swapper/0","prev_pid":0,"prev_prio":120,"prev_state":"R","next_comm":"worker-a","next_pid":10,"next_prio":120,"next_hint":640},"hint":0}"#,
+                r#"{"comm":"worker-a","pid":10,"tid":10,"cpu":0,"time":0.001,"event":"sched:sched_switch","trace":"worker-a:10 [120] R ==> swapper/0:0 [120]","fields":{"prev_comm":"worker-a","prev_pid":10,"prev_prio":120,"prev_state":"R","next_comm":"swapper/0","next_pid":0,"next_prio":120,"next_hint":0},"hint":640}"#,
+            ],
+        );
+
+        let opts = ExtractSchedUtilOpts {
+            file: path,
+            window_ms: 1,
+            categories: "worker-a,worker-a@hint=640".to_string(),
+            verbose: false,
+        };
+
+        let categories = parse_sched_categories(&opts.categories)?;
+        let window_ns = opts.window_ms * 1_000_000;
+        let mut agg = BucketAggregator::new(0, window_ns, categories);
+        let file = File::open(&opts.file)?;
+        let reader = BufReader::new(file);
+        let mut stats = TraceStats::default();
+        let mut tracker = SchedBusyTracker::new(agg);
+
+        for line in reader.lines() {
+            let line = line?;
+            let record: PerfSchedScriptRecord = serde_json::from_str(&line)?;
+            let Some(time_ns) = record
+                .sample_time_ns()
+                .or_else(|| sched_time_to_ns(record.time))
+            else {
+                continue;
+            };
+            if stats.trace_start_ns.is_none() {
+                tracker.sink.trace_start_ns = time_ns;
+            }
+            stats.observe(&record, time_ns);
+            tracker.process_record(record);
+        }
+        let (trace_end_ns, cpu_count) = stats.finish()?;
+        agg = tracker.finish(trace_end_ns);
+
+        let err = agg
+            .finalize(trace_end_ns, cpu_count, opts.window_ms)
+            .expect_err("expected overlapping categories to be rejected");
+        assert!(err
+            .to_string()
+            .contains("sched util categories are not mutually exclusive"));
 
         Ok(())
     }
