@@ -980,16 +980,26 @@ mod tests {
 
         let matcher = compile_category_matcher(&categories);
         let category_names: Vec<_> = categories.iter().map(|cat| cat.name.as_str()).collect();
-        assert_eq!(category_names[matcher.match_indices(&intervals[0])[0]], "worker-a@hint=0");
-        assert_eq!(category_names[matcher.match_indices(&intervals[1])[0]], "worker-a@hint=640");
-        assert_eq!(category_names[matcher.match_indices(&intervals[2])[0]], "svc-*");
+        assert_eq!(
+            category_names[matcher.match_indices(&intervals[0])[0]],
+            "worker-a@hint=0"
+        );
+        assert_eq!(
+            category_names[matcher.match_indices(&intervals[1])[0]],
+            "worker-a@hint=640"
+        );
+        assert_eq!(
+            category_names[matcher.match_indices(&intervals[2])[0]],
+            "svc-*"
+        );
 
         Ok(())
     }
 
     #[test]
     fn sched_util_auto_adds_zero_hint_category_for_hinted_specs() -> Result<()> {
-        let categories = parse_sched_categories("hhvmworker@hint=256,hhvmworker@hint=640,mcrpxy-*")?;
+        let categories =
+            parse_sched_categories("hhvmworker@hint=256,hhvmworker@hint=640,mcrpxy-*")?;
         let names: BTreeSet<_> = categories.iter().map(|cat| cat.name.as_str()).collect();
 
         assert!(names.contains("hhvmworker@hint=0"));

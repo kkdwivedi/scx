@@ -4,9 +4,9 @@
 // GNU General Public License version 2.
 
 use crate::record::{
-    perf_binary, perf_script_output_exists, report_perf_script_stderr,
-    PERF_MEM_DATA_FILE, PERF_MEM_JSONL_FILE, PERF_MEM_SCRIPT_FIELDS, PERF_MEM_SCRIPT_FILE,
-    PERF_SCHED_DATA_FILE, PERF_SCHED_JSONL_FILE, PERF_SCHED_SCRIPT_FIELDS, PERF_SCHED_SCRIPT_FILE,
+    perf_binary, perf_script_output_exists, report_perf_script_stderr, PERF_MEM_DATA_FILE,
+    PERF_MEM_JSONL_FILE, PERF_MEM_SCRIPT_FIELDS, PERF_MEM_SCRIPT_FILE, PERF_SCHED_DATA_FILE,
+    PERF_SCHED_JSONL_FILE, PERF_SCHED_SCRIPT_FIELDS, PERF_SCHED_SCRIPT_FILE,
 };
 use anyhow::{bail, Context as _, Result};
 use clap::Parser;
