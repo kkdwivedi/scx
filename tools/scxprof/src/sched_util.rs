@@ -526,6 +526,9 @@ fn pop_softirq_override(state: &mut CpuState) {
 fn parse_sched_categories(spec: &str) -> Result<Vec<CategorySpec>> {
     let mut categories = Vec::new();
     let mut seen_names = HashSet::new();
+    let mut hinted_comm_parts = BTreeSet::new();
+    let mut exact_zero_hint_comms = HashSet::new();
+    let mut glob_zero_hint_comms = HashSet::new();
 
     for raw_item in spec.split(',') {
         let item = raw_item.trim();
@@ -552,6 +555,20 @@ fn parse_sched_categories(spec: &str) -> Result<Vec<CategorySpec>> {
             CategoryCommMatcher::Exact(comm_part.to_string())
         };
 
+        if hint.is_some() {
+            hinted_comm_parts.insert(comm_part.to_string());
+        }
+        if hint == Some(0) {
+            match &comm_matcher {
+                CategoryCommMatcher::Exact(comm) => {
+                    exact_zero_hint_comms.insert(comm.clone());
+                }
+                CategoryCommMatcher::Glob(pattern) => {
+                    glob_zero_hint_comms.insert(pattern.clone());
+                }
+            }
+        }
+
         if !seen_names.insert(item.to_string()) {
             continue;
         }
@@ -560,6 +577,35 @@ fn parse_sched_categories(spec: &str) -> Result<Vec<CategorySpec>> {
             name: item.to_string(),
             comm_matcher,
             hint,
+        });
+    }
+
+    for comm_part in hinted_comm_parts {
+        let needs_zero_hint = if comm_part.contains('*') || comm_part.contains('?') {
+            !glob_zero_hint_comms.contains(&comm_part)
+        } else {
+            !exact_zero_hint_comms.contains(&comm_part)
+        };
+
+        if !needs_zero_hint {
+            continue;
+        }
+
+        let zero_hint_name = format!("{comm_part}@hint=0");
+        if !seen_names.insert(zero_hint_name.clone()) {
+            continue;
+        }
+
+        let comm_matcher = if comm_part.contains('*') || comm_part.contains('?') {
+            CategoryCommMatcher::Glob(comm_part.clone())
+        } else {
+            CategoryCommMatcher::Exact(comm_part.clone())
+        };
+
+        categories.push(CategorySpec {
+            name: zero_hint_name,
+            comm_matcher,
+            hint: Some(0),
         });
     }
 
@@ -900,8 +946,37 @@ mod tests {
         assert_eq!(intervals[2].hint, 0);
 
         let matcher = compile_category_matcher(&categories);
-        assert_eq!(matcher.match_indices(&intervals[1]), vec![0]);
-        assert_eq!(matcher.match_indices(&intervals[2]), vec![1]);
+        let category_names: Vec<_> = categories.iter().map(|cat| cat.name.as_str()).collect();
+        assert_eq!(category_names[matcher.match_indices(&intervals[0])[0]], "worker-a@hint=0");
+        assert_eq!(category_names[matcher.match_indices(&intervals[1])[0]], "worker-a@hint=640");
+        assert_eq!(category_names[matcher.match_indices(&intervals[2])[0]], "svc-*");
+
+        Ok(())
+    }
+
+    #[test]
+    fn sched_util_auto_adds_zero_hint_category_for_hinted_specs() -> Result<()> {
+        let categories = parse_sched_categories("hhvmworker@hint=256,hhvmworker@hint=640,mcrpxy-*")?;
+        let names: BTreeSet<_> = categories.iter().map(|cat| cat.name.as_str()).collect();
+
+        assert!(names.contains("hhvmworker@hint=0"));
+        assert!(names.contains("hhvmworker@hint=256"));
+        assert!(names.contains("hhvmworker@hint=640"));
+        assert!(!names.contains("mcrpxy-*@hint=0"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn sched_util_does_not_duplicate_explicit_zero_hint_category() -> Result<()> {
+        let categories = parse_sched_categories("hhvmworker@hint=0,hhvmworker@hint=384")?;
+        let names: Vec<_> = categories
+            .iter()
+            .filter(|cat| cat.name.starts_with("hhvmworker@hint="))
+            .map(|cat| cat.name.as_str())
+            .collect();
+
+        assert_eq!(names, vec!["hhvmworker@hint=0", "hhvmworker@hint=384"]);
 
         Ok(())
     }
@@ -957,7 +1032,8 @@ mod tests {
         let (output, _interval_count) = agg.finalize(trace_end_ns, cpu_count, opts.window_ms)?;
         assert_eq!(output.len(), 2);
         assert_eq!(output[0].total, 100.0);
-        assert_eq!(output[0].uncategorized, 50.0);
+        assert_eq!(output[0].uncategorized, 0.0);
+        assert_eq!(output[0].categories["worker-a@hint=0"], 50.0);
         assert_eq!(output[0].categories["worker-a@hint=640"], 50.0);
         assert_eq!(output[1].uncategorized, 100.0);
 
