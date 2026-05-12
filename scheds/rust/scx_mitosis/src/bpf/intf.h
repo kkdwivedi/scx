@@ -156,9 +156,6 @@ struct cell {
 	// Number of CPUs in this cell
 	u32 cpu_cnt;
 
-	// Number of LLCs with at least one CPU in this cell
-	u32 llc_present_cnt;
-
 	// LLC DSQs which currently have queued tasks but no CPUs in this cell
 	u64 llcs_to_drain;
 

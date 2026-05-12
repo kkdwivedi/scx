@@ -156,7 +156,7 @@ static __always_inline int recalc_cell_llc_counts(u32 cell_idx, const struct cpu
 		return -ENOMEM;
 	}
 
-	u32 llc, llcs_present = 0, total_cpus = 0;
+	u32 llc, total_cpus = 0;
 	u32 llc_cpu_cnt_tmp[MAX_LLCS] = { 0 };
 
 	const struct cpumask *cell_mask;
@@ -185,8 +185,6 @@ static __always_inline int recalc_cell_llc_counts(u32 cell_idx, const struct cpu
 
 		llc_cpu_cnt_tmp[llc] = cnt;
 		total_cpus += cnt;
-		if (cnt)
-			llcs_present++;
 	}
 
 	scoped_guard(spin_lock, &cell->lock)
@@ -200,7 +198,6 @@ static __always_inline int recalc_cell_llc_counts(u32 cell_idx, const struct cpu
 			cell->llcs[llc_idx].cpu_cnt = llc_cpu_cnt_tmp[llc_idx];
 		}
 
-		cell->llc_present_cnt = llcs_present;
 		cell->cpu_cnt = total_cpus;
 	}
 
