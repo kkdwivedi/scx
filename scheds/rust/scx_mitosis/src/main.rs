@@ -239,6 +239,7 @@ struct Cell {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Subcell {
     id: u32,
+    name: String,
     primary: Cpumask,
     borrowable: Option<Cpumask>,
     matches: Vec<Vec<SubcellMatch>>,
@@ -257,6 +258,7 @@ impl Subcell {
     fn new(id: u32) -> Self {
         Self {
             id,
+            name: default_subcell_name(id),
             primary: Cpumask::new(),
             borrowable: None,
             matches: Vec::new(),
@@ -847,6 +849,7 @@ impl<'a> Scheduler<'a> {
                 .iter()
                 .map(|subcell| Subcell {
                     id: subcell.id,
+                    name: subcell.name.clone(),
                     primary: Cpumask::new(),
                     borrowable: None,
                     matches: subcell.matches.clone(),
@@ -1057,6 +1060,16 @@ impl<'a> Scheduler<'a> {
                         .collect()
                 })
                 .unwrap_or_default();
+            let existing_names: HashMap<u32, String> = self
+                .cells
+                .get(cell_id)
+                .map(|cell| {
+                    cell.subcells
+                        .iter()
+                        .map(|subcell| (subcell.id, subcell.name.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
             let subcells: Vec<Subcell> = bpf_cell
                 .subcells
                 .iter()
@@ -1064,6 +1077,10 @@ impl<'a> Scheduler<'a> {
                 .map(|subcell| {
                     Ok(Subcell {
                         id: subcell.id,
+                        name: existing_names
+                            .get(&subcell.id)
+                            .cloned()
+                            .unwrap_or_else(|| default_subcell_name(subcell.id)),
                         primary: read_cpumask_from_bytes(&subcell.primary.mask)?,
                         borrowable: if self.enable_borrowing {
                             Some(read_cpumask_from_bytes(&subcell.borrowable.mask)?)
@@ -1543,7 +1560,7 @@ impl<'a> Scheduler<'a> {
                             .subcells
                             .entry(subcell.id)
                             .or_default()
-                            .num_cpus = subcell.primary.weight() as u32;
+                            .update_name_and_cpus(&subcell.name, subcell.primary.weight() as u32);
                     }
                 });
         }
@@ -1994,6 +2011,14 @@ fn write_cpumask_to_config(cpumask: &Cpumask, dest: &mut [u8]) {
                 dest[idx] = *byte;
             }
         }
+    }
+}
+
+fn default_subcell_name(id: u32) -> String {
+    if id == 0 {
+        "rest".to_string()
+    } else {
+        format!("subcell{}", id)
     }
 }
 
