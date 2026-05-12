@@ -3,13 +3,13 @@
  * This software may be used and distributed according to the terms of the
  * GNU General Public License version 2.
  *
- * LLC awareness for scx_mitosis. Each cell has one DSQ per LLC. Tasks prefer
- * the LLC of their previous CPU when that LLC has CPUs in the task's cell; if
- * not, they fall back to another served LLC in the same cell.
+ * LLC awareness for scx_mitosis. Each subcell has one DSQ per LLC. Tasks
+ * prefer the LLC of their previous CPU when that LLC has CPUs in the task's
+ * subcell; if not, they fall back to another served LLC in the same subcell.
  *
- * When a cell-LLC DSQ has queued work but no CPUs in that LLC, the DSQ is
- * marked for draining. CPUs in the same cell then consume those stranded DSQs
- * after their normally-served DSQs do not produce work.
+ * When a subcell-LLC DSQ has queued work but no CPUs in that LLC, the DSQ is
+ * marked for draining. CPUs in the same subcell then consume those stranded
+ * DSQs after their normally-served DSQs do not produce work.
  */
 #pragma once
 
@@ -55,116 +55,125 @@ static inline const struct cpumask *lookup_llc_cpumask(u32 llc)
 	return (const struct cpumask *)&llc_to_cpus[llc];
 }
 
-static inline bool cell_llc_has_cpus(struct cell *cell, u32 llc)
+static inline bool subcell_llc_has_cpus(struct subcell *subcell, u32 llc)
 {
-	if (!cell || !llc_is_active(llc))
+	if (!subcell || !llc_is_active(llc))
 		return false;
 
 	barrier_var(llc);
-	return READ_ONCE(cell->llcs[llc].cpu_cnt) > 0;
+	return READ_ONCE(subcell->llcs[llc].cpu_cnt) > 0;
 }
 
-static inline void cell_llc_drain_enable(struct cell *cell, u32 llc)
+static inline void subcell_llc_drain_enable(struct subcell *subcell, u32 llc)
 {
-	if (!cell || !llc_is_valid(llc))
+	if (!subcell || !llc_is_valid(llc))
 		return;
 
-	__sync_or_and_fetch(&cell->llcs_to_drain, 1LLU << llc);
+	__sync_or_and_fetch(&subcell->llcs_to_drain, 1LLU << llc);
 }
 
-static inline void cell_llc_drain_disable(struct cell *cell, u32 llc)
+static inline void subcell_llc_drain_disable(struct subcell *subcell, u32 llc)
 {
-	if (!cell || !llc_is_valid(llc))
+	if (!subcell || !llc_is_valid(llc))
 		return;
 
-	__sync_and_and_fetch(&cell->llcs_to_drain, ~(1LLU << llc));
+	__sync_and_and_fetch(&subcell->llcs_to_drain, ~(1LLU << llc));
 }
 
-static inline void kick_cell_drain_cpu(u32 cell_id)
+static inline void kick_subcell_drain_cpu(u32 cell_id, u32 subcell_id)
 {
-	const struct cpumask *cell_mask = lookup_cell_cpumask(cell_id);
+	const struct cpumask *subcell_mask = lookup_subcell_cpumask(cell_id, subcell_id);
 	s32 cpu;
 
-	if (!cell_mask)
+	if (!subcell_mask)
 		return;
 
-	cpu = scx_bpf_pick_idle_cpu(cell_mask, SCX_PICK_IDLE_CORE);
+	cpu = scx_bpf_pick_idle_cpu(subcell_mask, SCX_PICK_IDLE_CORE);
 	if (cpu < 0)
-		cpu = scx_bpf_pick_idle_cpu(cell_mask, 0);
+		cpu = scx_bpf_pick_idle_cpu(subcell_mask, 0);
 	if (cpu < 0)
-		cpu = bpf_cpumask_any_distribute(cell_mask);
+		cpu = bpf_cpumask_any_distribute(subcell_mask);
 
 	if (cpu >= 0 && cpu < nr_possible_cpus)
 		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 }
 
-static inline void refresh_cell_llc_drain(struct cell *cell, u32 cell_id, u32 llc, u32 cpu_cnt)
+static inline void refresh_subcell_llc_drain(struct subcell *subcell, u32 cell_id,
+					     u32 subcell_id, u32 llc, u32 cpu_cnt)
 {
 	dsq_id_t dsq;
 
-	if (!cell || !llc_is_active(llc))
+	if (!subcell || !llc_is_active(llc))
 		return;
 
-	dsq = get_cell_llc_dsq_id(cell_id, llc);
+	dsq = get_subcell_llc_dsq_id(cell_id, subcell_id, llc);
 	if (dsq_is_invalid(dsq))
 		return;
 
 	if (cpu_cnt) {
-		cell_llc_drain_disable(cell, llc);
+		subcell_llc_drain_disable(subcell, llc);
 		return;
 	}
 
 	if (scx_bpf_dsq_nr_queued(dsq.raw)) {
-		cell_llc_drain_enable(cell, llc);
-		kick_cell_drain_cpu(cell_id);
+		subcell_llc_drain_enable(subcell, llc);
+		kick_subcell_drain_cpu(cell_id, subcell_id);
 	} else {
-		cell_llc_drain_disable(cell, llc);
+		subcell_llc_drain_disable(subcell, llc);
 	}
 }
 
-static inline void refresh_cell_llc_drain_after_enqueue(u32 cell_id, u32 llc)
+static inline void refresh_subcell_llc_drain_after_enqueue(u32 cell_id, u32 subcell_id, u32 llc)
 {
-	struct cell *cell = lookup_cell(cell_id);
+	struct subcell *subcell = lookup_subcell(cell_id, subcell_id);
 
-	if (!cell || !llc_is_active(llc))
+	if (!subcell || !llc_is_active(llc))
 		return;
 
-	if (READ_ONCE(cell->llcs[llc].cpu_cnt))
+	if (READ_ONCE(subcell->llcs[llc].cpu_cnt))
 		return;
 
-	cell_llc_drain_enable(cell, llc);
-	kick_cell_drain_cpu(cell_id);
+	subcell_llc_drain_enable(subcell, llc);
+	kick_subcell_drain_cpu(cell_id, subcell_id);
 }
 
 /*
- * Recompute per-LLC CPU counts for a cell cpumask.
+ * Recompute per-LLC CPU counts for a subcell cpumask.
  *
  * @cell_idx: The cell index to update LLC counts for.
+ * @subcell_idx: The subcell index to update LLC counts for.
  * @explicit_mask: If non-NULL, use this cpumask instead of looking up the
- * current cell cpumask. This allows pre-calculating counts for a new cpumask
- * before swapping it in.
+ * current subcell cpumask. This allows pre-calculating counts for a new
+ * cpumask before swapping it in.
  */
-static __always_inline int recalc_cell_llc_counts(u32 cell_idx, const struct cpumask *explicit_mask)
+static __always_inline int recalc_subcell_llc_counts(u32 cell_idx, u32 subcell_idx,
+						     const struct cpumask *explicit_mask)
 {
+	struct bpf_cpumask *tmp_mask __free(bpf_cpumask) = NULL;
 	struct cell *cell = lookup_cell(cell_idx);
-	if (!cell)
-		return -ENOENT;
-
-	struct bpf_cpumask *tmp_mask __free(bpf_cpumask) = bpf_cpumask_create();
-	if (!tmp_mask) {
-		scx_bpf_error("recalc_cell_llc_counts: failed to create tmp mask");
-		return -ENOMEM;
-	}
-
+	struct subcell *subcell;
+	const struct cpumask *subcell_mask;
 	u32 llc, total_cpus = 0;
 	u32 llc_cpu_cnt_tmp[MAX_LLCS] = { 0 };
 
-	const struct cpumask *cell_mask;
+	if (!cell)
+		return -ENOENT;
+
+	subcell = lookup_subcell(cell_idx, subcell_idx);
+	if (!subcell)
+		return -ENOENT;
+
+	tmp_mask = bpf_cpumask_create();
+	if (!tmp_mask) {
+		scx_bpf_error("recalc_subcell_llc_counts: failed to create tmp mask");
+		return -ENOMEM;
+	}
+
 	if (explicit_mask) {
-		cell_mask = explicit_mask;
+		subcell_mask = explicit_mask;
 	} else {
-		cell_mask = lookup_cell_cpumask(cell_idx);
-		if (!cell_mask)
+		subcell_mask = lookup_subcell_cpumask(cell_idx, subcell_idx);
+		if (!subcell_mask)
 			return -EINVAL;
 	}
 
@@ -180,7 +189,7 @@ static __always_inline int recalc_cell_llc_counts(u32 cell_idx, const struct cpu
 		if (!llc_mask)
 			return -ENOENT;
 
-		bpf_cpumask_and(tmp_mask, cell_mask, llc_mask);
+		bpf_cpumask_and(tmp_mask, subcell_mask, llc_mask);
 		cnt = bpf_cpumask_weight((const struct cpumask *)tmp_mask);
 
 		llc_cpu_cnt_tmp[llc] = cnt;
@@ -195,36 +204,39 @@ static __always_inline int recalc_cell_llc_counts(u32 cell_idx, const struct cpu
 		{
 			if (llc_idx >= MAX_LLCS)
 				break;
-			cell->llcs[llc_idx].cpu_cnt = llc_cpu_cnt_tmp[llc_idx];
+			subcell->llcs[llc_idx].cpu_cnt = llc_cpu_cnt_tmp[llc_idx];
 		}
 
-		cell->cpu_cnt = total_cpus;
+		if (subcell_idx == 0)
+			cell->cpu_cnt = total_cpus;
+		subcell->cpu_cnt = total_cpus;
 	}
 
 	bpf_for(llc, 0, nr_llc)
 	{
 		if (llc >= MAX_LLCS)
 			break;
-		refresh_cell_llc_drain(cell, cell_idx, llc, llc_cpu_cnt_tmp[llc]);
+		refresh_subcell_llc_drain(subcell, cell_idx, subcell_idx, llc,
+					  llc_cpu_cnt_tmp[llc]);
 	}
 
 	return 0;
 }
 
-static inline s32 pick_llc_for_task(struct task_struct *p, u32 cell_id)
+static inline s32 pick_llc_for_task(struct task_struct *p, u32 cell_id, u32 subcell_id)
 {
-	struct cell *cell = lookup_cell(cell_id);
+	struct subcell *subcell = lookup_subcell(cell_id, subcell_id);
 	s32 task_cpu;
 	u32 llc;
 
-	if (!cell)
+	if (!subcell)
 		return LLC_INVALID;
 
 	task_cpu = scx_bpf_task_cpu(p);
 	if (task_cpu >= 0 && task_cpu < MAX_CPUS) {
 		u32 prev_llc = cpu_to_llc[task_cpu];
 
-		if (cell_llc_has_cpus(cell, prev_llc))
+		if (subcell_llc_has_cpus(subcell, prev_llc))
 			return prev_llc;
 	}
 
@@ -232,42 +244,43 @@ static inline s32 pick_llc_for_task(struct task_struct *p, u32 cell_id)
 	{
 		if (llc >= MAX_LLCS)
 			break;
-		if (cell_llc_has_cpus(cell, llc))
+		if (subcell_llc_has_cpus(subcell, llc))
 			return llc;
 	}
 
-	scx_bpf_error("pick_llc_for_task: cell %d has no LLC with CPUs", cell_id);
+	scx_bpf_error("pick_llc_for_task: cell %d subcell %d has no LLC with CPUs",
+		      cell_id, subcell_id);
 	return LLC_INVALID;
 }
 
-static void zero_cell_vtimes(struct cell *cell)
+static void zero_subcell_vtimes(struct subcell *subcell)
 {
 	if (enable_llc_awareness) {
 		u32 llc_idx;
 		bpf_for(llc_idx, 0, MAX_LLCS)
 		{
-			WRITE_ONCE(cell->llcs[llc_idx].vtime_now, 0);
+			WRITE_ONCE(subcell->llcs[llc_idx].vtime_now, 0);
 		}
 	} else {
-		WRITE_ONCE(cell->llcs[FAKE_FLAT_CELL_LLC].vtime_now, 0);
+		WRITE_ONCE(subcell->llcs[FAKE_FLAT_SUBCELL_LLC].vtime_now, 0);
 	}
 }
 
-static inline bool try_drain_cell_llcs(u32 cell_id, s32 local_llc)
+static inline bool try_drain_subcell_llcs(u32 cell_id, u32 subcell_id, s32 local_llc)
 {
-	struct cell *cell = lookup_cell(cell_id);
+	struct subcell *subcell = lookup_subcell(cell_id, subcell_id);
 	u64 drain_mask;
 	u32 cnt, nr, u;
 
-	if (!cell || !llc_is_active(local_llc))
+	if (!subcell || !llc_is_active(local_llc))
 		return false;
 
-	drain_mask = READ_ONCE(cell->llcs_to_drain);
+	drain_mask = READ_ONCE(subcell->llcs_to_drain);
 	if (!drain_mask)
 		return false;
 
-	cnt = READ_ONCE(cell->llc_drain_cnt);
-	WRITE_ONCE(cell->llc_drain_cnt, cnt + 1);
+	cnt = READ_ONCE(subcell->llc_drain_cnt);
+	WRITE_ONCE(subcell->llc_drain_cnt, cnt + 1);
 	nr = nr_llc;
 	if (!nr)
 		return false;
@@ -289,15 +302,15 @@ static inline bool try_drain_cell_llcs(u32 cell_id, s32 local_llc)
 			continue;
 
 		bit = 1LLU << candidate_llc;
-		if (!(READ_ONCE(cell->llcs_to_drain) & bit))
+		if (!(READ_ONCE(subcell->llcs_to_drain) & bit))
 			continue;
 
-		if (READ_ONCE(cell->llcs[candidate_llc].cpu_cnt)) {
-			cell_llc_drain_disable(cell, candidate_llc);
+		if (READ_ONCE(subcell->llcs[candidate_llc].cpu_cnt)) {
+			subcell_llc_drain_disable(subcell, candidate_llc);
 			continue;
 		}
 
-		candidate_dsq = get_cell_llc_dsq_id(cell_id, candidate_llc);
+		candidate_dsq = get_subcell_llc_dsq_id(cell_id, subcell_id, candidate_llc);
 		if (dsq_is_invalid(candidate_dsq))
 			continue;
 
@@ -306,14 +319,14 @@ static inline bool try_drain_cell_llcs(u32 cell_id, s32 local_llc)
 		 * If we raced with a concurrent enqueue, re-enable afterwards.
 		 */
 		if (scx_bpf_dsq_nr_queued(candidate_dsq.raw) <= 1) {
-			cell_llc_drain_disable(cell, candidate_llc);
+			subcell_llc_drain_disable(subcell, candidate_llc);
 			disabled = true;
 		}
 
 		consumed = scx_bpf_dsq_move_to_local(candidate_dsq.raw, 0);
 
 		if (disabled && scx_bpf_dsq_nr_queued(candidate_dsq.raw))
-			cell_llc_drain_enable(cell, candidate_llc);
+			subcell_llc_drain_enable(subcell, candidate_llc);
 
 		if (consumed)
 			return true;
@@ -326,7 +339,7 @@ static inline int update_task_llc_assignment(struct task_struct *p, struct task_
 {
 	const struct cpumask *llc_mask = NULL;
 	struct bpf_cpumask *cpumask;
-	struct cell *cell;
+	struct subcell *subcell;
 	s32 new_llc;
 
 	if (!tctx) {
@@ -334,7 +347,7 @@ static inline int update_task_llc_assignment(struct task_struct *p, struct task_
 		return -ENOENT;
 	}
 
-	new_llc = pick_llc_for_task(p, tctx->cell);
+	new_llc = pick_llc_for_task(p, tctx->cell, tctx->subcell);
 	if (new_llc < 0)
 		return -EINVAL;
 
@@ -355,14 +368,14 @@ static inline int update_task_llc_assignment(struct task_struct *p, struct task_
 		return -EINVAL;
 	}
 
-	tctx->dsq = get_cell_llc_dsq_id(tctx->cell, tctx->llc);
+	tctx->dsq = get_subcell_llc_dsq_id(tctx->cell, tctx->subcell, tctx->llc);
 	if (dsq_is_invalid(tctx->dsq))
 		return -EINVAL;
 
-	cell = lookup_cell(tctx->cell);
-	if (!cell)
+	subcell = lookup_subcell(tctx->cell, tctx->subcell);
+	if (!subcell)
 		return -ENOENT;
 
-	p->scx.dsq_vtime = READ_ONCE(cell->llcs[new_llc].vtime_now);
+	p->scx.dsq_vtime = READ_ONCE(subcell->llcs[new_llc].vtime_now);
 	return 0;
 }
