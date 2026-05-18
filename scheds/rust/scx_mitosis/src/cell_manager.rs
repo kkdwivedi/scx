@@ -31,8 +31,9 @@ pub struct CellInfo {
 
 /// Generic allocation input for a CPU partitioning recipient.
 ///
-/// `allowed=None` means unpinned: the recipient does not claim any specific CPUs
-/// and only participates in the unclaimed pool.
+/// `allowed=None` means unpinned: the recipient does not claim any specific CPUs.
+/// It prefers unclaimed CPUs, but can receive a fallback CPU from a pinned
+/// recipient to avoid starvation when cpusets cover the full domain.
 #[derive(Debug, Clone)]
 pub(crate) struct CpuRecipient {
     pub id: u32,
@@ -226,7 +227,8 @@ impl<'a> CpuManager<'a> {
     /// Compute CPU assignments over `domain` for a generic set of recipients.
     ///
     /// Recipients with `allowed=Some(mask)` claim CPUs in that mask. Recipients with
-    /// `allowed=None` are unpinned and only receive from the unclaimed pool.
+    /// `allowed=None` are unpinned. They prefer unclaimed CPUs and receive a
+    /// fallback CPU from a pinned recipient if cpusets cover the full domain.
     ///
     /// When allowed masks overlap, contested CPUs are divided proportionally among
     /// claimants. Unclaimed CPUs go to unpinned recipients.
@@ -425,7 +427,63 @@ impl<'a> CpuManager<'a> {
             }
         }
 
-        // Phase 5: Verify all recipients have at least one CPU assigned
+        // Phase 5: Ensure unpinned recipients are not starved when pinned
+        // recipients' cpusets cover the full domain. This can happen for cell 0
+        // or for cgroups without cpuset.cpus configured. Donate one CPU from the
+        // largest recipient with spare CPUs. Pinned donors keep at least one CPU.
+        let mut starved_unpinned: Vec<u32> = recipients
+            .iter()
+            .filter(|recipient| recipient.allowed.is_none())
+            .filter(|recipient| {
+                recipient_cpus
+                    .get(&recipient.id)
+                    .map_or(true, |mask| mask.weight() == 0)
+            })
+            .map(|recipient| recipient.id)
+            .collect();
+        starved_unpinned.sort();
+
+        for starved_id in starved_unpinned {
+            let Some(donor_id) = recipient_cpus
+                .iter()
+                .filter(|(id, mask)| **id != starved_id && mask.weight() > 1)
+                .max_by(|(a_id, a_mask), (b_id, b_mask)| {
+                    a_mask
+                        .weight()
+                        .cmp(&b_mask.weight())
+                        .then_with(|| b_id.cmp(a_id))
+                })
+                .map(|(id, _)| *id)
+            else {
+                bail!(
+                    "Cell {} has no CPUs assigned and no donor has spare CPUs (nr_cpus={}, num_cells={})",
+                    starved_id,
+                    domain.weight(),
+                    recipients.len()
+                );
+            };
+
+            let cpu = recipient_cpus
+                .get(&donor_id)
+                .and_then(|mask| mask.iter().next())
+                .expect("BUG: donor with spare CPUs had no CPUs");
+
+            let mut donated = Cpumask::new();
+            donated.set_cpu(cpu).ok();
+
+            let donor_mask = recipient_cpus
+                .get_mut(&donor_id)
+                .expect("BUG: selected donor disappeared");
+            *donor_mask = donor_mask.and(&donated.not());
+
+            recipient_cpus
+                .entry(starved_id)
+                .or_insert_with(Cpumask::new)
+                .set_cpu(cpu)
+                .ok();
+        }
+
+        // Phase 6: Verify all recipients have at least one CPU assigned
         for recipient in recipients {
             if !recipient_cpus.contains_key(&recipient.id)
                 || recipient_cpus
@@ -446,7 +504,7 @@ impl<'a> CpuManager<'a> {
             .map(|recipient| (recipient.id, recipient.allowed.clone()))
             .collect();
 
-        // Phase 6: Build CpuAssignment results, optionally computing borrowable masks
+        // Phase 7: Build CpuAssignment results, optionally computing borrowable masks
         Ok(recipient_cpus
             .into_iter()
             .map(|(id, primary)| {
@@ -1337,7 +1395,8 @@ mod tests {
     fn test_cpu_assignments_cpusets_cover_all_cpus() {
         let tmp = TempDir::new().unwrap();
 
-        // Create cgroups that cover all CPUs - cell 0 gets nothing, which is an error
+        // Create cgroups that cover all CPUs. Cell 0 still needs a CPU even
+        // though it doesn't have a cpuset of its own.
         let cell1_path = tmp.path().join("cell1");
         std::fs::create_dir(&cell1_path).unwrap();
         std::fs::write(cell1_path.join("cpuset.cpus"), "0-7\n").unwrap();
@@ -1353,17 +1412,64 @@ mod tests {
             HashSet::new(),
         )
         .unwrap();
-        let result = mgr.compute_cpu_assignments(false);
+        let assignments = mgr.compute_cpu_assignments(false).unwrap();
 
-        // Should error because cell 0 has no CPUs
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        let err_msg = format!("{:#}", err);
-        assert!(
-            err_msg.contains("Cell 0 has no CPUs assigned"),
-            "Expected 'Cell 0 has no CPUs assigned' error, got: {}",
-            err_msg
+        let cell0 = find_assignment(&assignments, 0);
+        let cell1_info = mgr.find_cell_by_name("cell1").unwrap();
+        let cell2_info = mgr.find_cell_by_name("cell2").unwrap();
+        let cell1 = find_assignment(&assignments, cell1_info.cell_id);
+        let cell2 = find_assignment(&assignments, cell2_info.cell_id);
+
+        assert_eq!(cell0.primary.weight(), 1);
+        assert_eq!(
+            cell0.primary.weight() + cell1.primary.weight() + cell2.primary.weight(),
+            16
         );
+
+        for cpu in 0..16 {
+            let count = usize::from(cell0.primary.test_cpu(cpu))
+                + usize::from(cell1.primary.test_cpu(cpu))
+                + usize::from(cell2.primary.test_cpu(cpu));
+            assert_eq!(count, 1, "CPU {} assigned {} times", cpu, count);
+        }
+    }
+
+    #[test]
+    fn test_cpu_assignments_unpinned_cell_fallback_when_cpusets_cover_all_cpus() {
+        let tmp = TempDir::new().unwrap();
+
+        let pinned_path = tmp.path().join("pinned");
+        std::fs::create_dir(&pinned_path).unwrap();
+        std::fs::write(pinned_path.join("cpuset.cpus"), "0-7\n").unwrap();
+
+        let unpinned_path = tmp.path().join("unpinned");
+        std::fs::create_dir(&unpinned_path).unwrap();
+
+        let mgr = CellManager::new_with_path(
+            tmp.path().to_path_buf(),
+            256,
+            cpumask_for_range(8),
+            HashSet::new(),
+        )
+        .unwrap();
+        let assignments = mgr.compute_cpu_assignments(false).unwrap();
+
+        let cell0 = find_assignment(&assignments, 0);
+        let pinned_info = mgr.find_cell_by_name("pinned").unwrap();
+        let unpinned_info = mgr.find_cell_by_name("unpinned").unwrap();
+        let pinned = find_assignment(&assignments, pinned_info.cell_id);
+        let unpinned = find_assignment(&assignments, unpinned_info.cell_id);
+
+        assert_eq!(cell0.primary.weight(), 1);
+        assert_eq!(unpinned.primary.weight(), 1);
+        assert_eq!(pinned.primary.weight(), 6);
+
+        for cpu in 0..8 {
+            let count = usize::from(cell0.primary.test_cpu(cpu))
+                + usize::from(pinned.primary.test_cpu(cpu))
+                + usize::from(unpinned.primary.test_cpu(cpu));
+            assert_eq!(count, 1, "CPU {} assigned {} times", cpu, count);
+        }
     }
 
     #[test]
