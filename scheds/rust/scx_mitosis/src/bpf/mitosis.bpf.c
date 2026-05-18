@@ -2821,13 +2821,9 @@ int apply_cell_config(void *ctx)
 		bpf_for_each(css, pos, root_css, BPF_CGROUP_ITER_DESCENDANTS_PRE) {
 			cur_cgrp = pos->cgroup;
 
-			/*
-			 * Look up cgrp_ctx for this cgroup. For dying cgroups
-			 * or those without storage, this may fail - that's OK
-			 * since they can't have tasks anyway.
-			 */
 			struct cgrp_ctx *cgrp_ctx;
-			cgrp_ctx = lookup_cgrp_ctx_fallible(cur_cgrp);
+			cgrp_ctx = bpf_cgrp_storage_get(&cgrp_ctxs, cur_cgrp, 0,
+							BPF_LOCAL_STORAGE_GET_F_CREATE);
 			if (!cgrp_ctx)
 				continue;
 
