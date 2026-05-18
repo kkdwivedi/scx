@@ -971,6 +971,9 @@ void BPF_STRUCT_OPS(mitosis_enqueue, struct task_struct *p, u64 enq_flags)
 		if (dynamic_affinity_cpu_selection) {
 			cpu = enqueue_pinned_cpu(p, tctx);
 			vtime = p->scx.dsq_vtime; /* re-read: may have been reset */
+			/* Kick target CPU — select_cpu may have returned a different one */
+			if (cpu >= 0)
+				scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 		} else {
 			cpu = get_cpu_from_dsq(tctx->dsq);
 		}
@@ -1058,12 +1061,8 @@ void BPF_STRUCT_OPS(mitosis_enqueue, struct task_struct *p, u64 enq_flags)
 			slice_shrink_on_enqueue(curr, tctx, tctx->cell, cctx);
 	}
 
-	/*
-	 * Kick after inserting into custom per-CPU DSQs. Kicking before the
-	 * insert can race with dispatch seeing an empty DSQ, and
-	 * SCX_ENQ_CPU_SELECTED can otherwise suppress the post-insert kick.
-	 */
-	if ((!__COMPAT_is_enq_cpu_selected(enq_flags) || !tctx->all_cell_cpus_allowed) && cpu >= 0)
+	/* Kick the CPU if needed */
+	if (!__COMPAT_is_enq_cpu_selected(enq_flags) && cpu >= 0)
 		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 }
 
