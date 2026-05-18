@@ -2774,9 +2774,11 @@ int apply_cell_config(void *ctx)
 			 */
 			continue;
 
-		cgc = lookup_cgrp_ctx(cg);
-		if (!cgc)
+		cgc = bpf_cgrp_storage_get(&cgrp_ctxs, cg, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
+		if (!cgc) {
+			scx_bpf_error("cgrp_ctx creation failed for configured cgid %llu", cgid);
 			return -ENOENT;
+		}
 
 		cell = lookup_cell(cell_id);
 		if (!cell)
