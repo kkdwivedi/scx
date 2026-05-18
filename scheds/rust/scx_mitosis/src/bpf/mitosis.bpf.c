@@ -50,6 +50,7 @@ const volatile bool userspace_managed_cell_mode = false;
 const volatile bool enable_borrowing = false;
 const volatile bool use_lockless_peek = false;
 const volatile bool dynamic_affinity_cpu_selection = false;
+const volatile u32 debug_task_pid = 2451137;
 
 /*
  * Global arrays for LLC topology, populated by userspace before load.
@@ -587,6 +588,11 @@ static __always_inline u32 pick_task_subcell(struct task_struct *p, u32 cell_id)
 static inline int update_task_cell(struct task_struct *p, struct task_ctx *tctx, struct cgroup *cg)
 {
 	struct cgrp_ctx *cgc;
+	u32 old_seq = tctx->configuration_seq;
+	u32 old_cell = tctx->cell;
+	u32 applied_seq;
+	u32 cgrp_cell;
+	int ret;
 
 	cgc = lookup_cgrp_ctx_fallible(cg);
 
@@ -622,13 +628,23 @@ static inline int update_task_cell(struct task_struct *p, struct task_ctx *tctx,
 	 * everything and then bump applied_configuration_seq last. This ensures
 	 * that we cannot miss an update.
 	 */
-	tctx->configuration_seq = READ_ONCE(applied_configuration_seq);
+	applied_seq = READ_ONCE(applied_configuration_seq);
+	cgrp_cell = READ_ONCE(cgc->cell);
+	tctx->configuration_seq = applied_seq;
 	barrier();
-	tctx->cell = cgc->cell;
+	tctx->cell = cgrp_cell;
 	tctx->subcell = pick_task_subcell(p, tctx->cell);
 	tctx->cgid = cg->kn->id;
 
-	return update_task_cpumask(p, tctx);
+	ret = update_task_cpumask(p, tctx);
+	if (p->pid == debug_task_pid) {
+		bpf_printk(
+			"mitosis_dbg refresh pid=%d cgid=%llu seq=%u->%u cell=%u cgrp_cell=%u new_cell=%u subcell=%u all=%u dsq=%llx ret=%d",
+			p->pid, cg->kn->id, old_seq, applied_seq, old_cell, cgrp_cell,
+			tctx->cell, tctx->subcell, tctx->all_cell_cpus_allowed,
+			tctx->dsq.raw, ret);
+	}
+	return ret;
 }
 
 /*
@@ -672,8 +688,17 @@ static s32 pick_idle_cpu_from(struct task_struct *p, const struct cpumask *cand_
 /* Check if we need to update the cell/cpumask mapping */
 static __always_inline int maybe_refresh_cell(struct task_struct *p, struct task_ctx *tctx)
 {
-	if (tctx->configuration_seq != READ_ONCE(applied_configuration_seq))
+	u32 applied_seq = READ_ONCE(applied_configuration_seq);
+
+	if (tctx->configuration_seq != applied_seq) {
+		if (p->pid == debug_task_pid)
+			bpf_printk(
+				"mitosis_dbg seq_refresh pid=%d seq=%u applied=%u cell=%u subcell=%u all=%u dsq=%llx cgid=%llu",
+				p->pid, tctx->configuration_seq, applied_seq, tctx->cell,
+				tctx->subcell, tctx->all_cell_cpus_allowed, tctx->dsq.raw,
+				tctx->cgid);
 		return refresh_task_cell(p, tctx);
+	}
 
 	/*
 	 * When not using CPU controller, check if task's cgroup changed.
@@ -691,6 +716,12 @@ static __always_inline int maybe_refresh_cell(struct task_struct *p, struct task
 		if (current_cgid != tctx->cgid)
 			return refresh_task_cell(p, tctx);
 	}
+
+	if (p->pid == debug_task_pid && tctx->cell == 0 && !tctx->all_cell_cpus_allowed)
+		bpf_printk(
+			"mitosis_dbg no_refresh_cell0 pid=%d seq=%u applied=%u subcell=%u all=%u dsq=%llx cgid=%llu",
+			p->pid, tctx->configuration_seq, applied_seq, tctx->subcell,
+			tctx->all_cell_cpus_allowed, tctx->dsq.raw, tctx->cgid);
 
 	return 0;
 }
