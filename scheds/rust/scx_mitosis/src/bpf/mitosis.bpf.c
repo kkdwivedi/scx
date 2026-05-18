@@ -1083,6 +1083,17 @@ void BPF_STRUCT_OPS(mitosis_enqueue, struct task_struct *p, u64 enq_flags)
 
 	scx_bpf_dsq_insert_vtime(p, tctx->dsq.raw, slice_ns, vtime, enq_flags);
 
+	if (cpu < 0 && tctx->all_cell_cpus_allowed && __COMPAT_is_enq_cpu_selected(enq_flags)) {
+		if (tctx->cpumask &&
+		    bpf_cpumask_test_cpu(task_cpu, (const struct cpumask *)tctx->cpumask)) {
+			cpu = task_cpu;
+		} else if (tctx->cpumask) {
+			cpu = bpf_cpumask_any_distribute((const struct cpumask *)tctx->cpumask);
+			if (cpu >= nr_possible_cpus)
+				cpu = -1;
+		}
+	}
+
 	/* Shrink the running task's slice for this pinned waiter.
 	 * We know this task is pinned (!all_cell_cpus_allowed). */
 	if (!tctx->all_cell_cpus_allowed && enable_slice_shrinking) {
@@ -1093,7 +1104,8 @@ void BPF_STRUCT_OPS(mitosis_enqueue, struct task_struct *p, u64 enq_flags)
 	}
 
 	/* Kick the CPU if needed */
-	if (!__COMPAT_is_enq_cpu_selected(enq_flags) && cpu >= 0)
+	if (cpu >= 0 &&
+	    (!__COMPAT_is_enq_cpu_selected(enq_flags) || tctx->all_cell_cpus_allowed))
 		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 }
 
