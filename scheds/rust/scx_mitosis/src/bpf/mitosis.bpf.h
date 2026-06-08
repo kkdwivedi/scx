@@ -40,7 +40,6 @@ enum mitosis_constants {
  * Variables populated by userspace
  */
 const volatile bool enable_llc_awareness = false;
-const volatile bool enable_work_stealing = false;
 const volatile u32 nr_llc = 1;
 
 static inline struct cell *lookup_cell(int idx)
@@ -89,9 +88,6 @@ struct task_ctx {
 	s32 llc;
 
 	u64 avg_runtime_ns; /* EWMA of per-wake runtimes (ns), init to 0 */
-
-	u32 steal_count; /* how many times this task has been stolen */
-	u64 last_stolen_at; /* ns timestamp of the last steal (scx_bpf_now) */
 };
 
 static inline struct task_ctx *lookup_task_ctx(struct task_struct *p);

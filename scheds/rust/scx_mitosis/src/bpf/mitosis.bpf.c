@@ -875,6 +875,9 @@ void BPF_STRUCT_OPS(mitosis_enqueue, struct task_struct *p, u64 enq_flags)
 
 	scx_bpf_dsq_insert_vtime(p, tctx->dsq.raw, slice_ns, vtime, enq_flags);
 
+	if (enable_llc_awareness && tctx->all_cell_cpus_allowed)
+		refresh_cell_llc_drain_after_enqueue(tctx->cell, tctx->llc);
+
 	/* Shrink the running task's slice for this pinned waiter.
 	 * We know this task is pinned (!all_cell_cpus_allowed). */
 	if (!tctx->all_cell_cpus_allowed && enable_slice_shrinking) {
@@ -931,21 +934,12 @@ void BPF_STRUCT_OPS(mitosis_dispatch, s32 cpu, struct task_struct *prev)
 	}
 
 	/*
-	 * If we failed to find an eligible task, try work stealing if enabled.
 	 * Otherwise, scx will keep running prev if prev->scx.flags &
 	 * SCX_TASK_QUEUED (we don't set SCX_OPS_ENQ_LAST), and otherwise go idle.
 	 */
 	if (!found) {
-		/* Try work stealing if enabled */
-		if (enable_llc_awareness && enable_work_stealing) {
-			/* Returns: <0 error, 0 no steal, >0 stole work */
-			s32 ret = try_stealing_work(cell, llc);
-			if (ret < 0)
-				return;
-			if (ret > 0) {
-				cstat_inc(CSTAT_STEAL, cell, cctx);
-			}
-		}
+		if (enable_llc_awareness && try_drain_cell_llcs(cell, llc))
+			cstat_inc(CSTAT_LLC_DRAIN, cell, cctx);
 		return;
 	}
 
@@ -959,9 +953,16 @@ void BPF_STRUCT_OPS(mitosis_dispatch, s32 cpu, struct task_struct *prev)
 	if (scx_bpf_dsq_move_to_local(min_vtime_dsq.raw, 0))
 		return;
 
-	/* Winner was cell DSQ but failed - try the CPU DSQ */
-	if (min_vtime_dsq.raw == cell_dsq.raw)
-		scx_bpf_dsq_move_to_local(cpu_dsq.raw, 0);
+	/* Winner failed due to a race. Try the other local DSQ before idling. */
+	if (min_vtime_dsq.raw == cell_dsq.raw) {
+		if (scx_bpf_dsq_move_to_local(cpu_dsq.raw, 0))
+			return;
+	} else if (scx_bpf_dsq_move_to_local(cell_dsq.raw, 0)) {
+		return;
+	}
+
+	if (enable_llc_awareness && try_drain_cell_llcs(cell, llc))
+		cstat_inc(CSTAT_LLC_DRAIN, cell, cctx);
 }
 
 /*
@@ -1342,12 +1343,6 @@ void BPF_STRUCT_OPS(mitosis_running, struct task_struct *p)
 	if (!(cctx = lookup_cpu_ctx(-1)) || !(tctx = lookup_task_ctx(p)))
 		return;
 
-	/* Handle stolen task retag (LLC-aware mode only) */
-	if (enable_llc_awareness && enable_work_stealing) {
-		if (maybe_retag_stolen_task(p, tctx, cctx) < 0)
-			return;
-	}
-
 	/* Record the running slice start time. */
 	tctx->started_running_at = scx_bpf_now();
 
@@ -1688,12 +1683,6 @@ s32 validate_flags()
 	if (enable_llc_awareness && (nr_llc < 1 || nr_llc > MAX_LLCS)) {
 		scx_bpf_error("LLC-aware mode requires nr_llc between 1 and %d inclusive, got %d",
 			      MAX_LLCS, nr_llc);
-		return -EINVAL;
-	}
-
-	/* Work stealing only makes sense when enable_llc_awareness. */
-	if (enable_work_stealing && (!enable_llc_awareness)) {
-		scx_bpf_error("Work stealing requires LLC-aware mode to be enabled");
 		return -EINVAL;
 	}
 

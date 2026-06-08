@@ -31,6 +31,8 @@ enum consts {
 	CPUMASK_LONG_ENTRIES = 128,
 };
 
+_Static_assert(MAX_LLCS <= 64, "MAX_LLCS must fit in LLC drain bitmap");
+
 /*
  * LLC cpumask for topology arrays. This is a fixed-size structure that
  * matches the kernel's struct cpumask layout and can be used by both
@@ -72,7 +74,7 @@ enum cell_stat_idx {
 	CSTAT_CELL_DSQ,
 	CSTAT_AFFN_VIOL,
 	CSTAT_BORROWED,
-	CSTAT_STEAL,
+	CSTAT_LLC_DRAIN,
 	CSTAT_CLAMP_USED,
 	CSTAT_PIN_SKIP,
 	CSTAT_SLICE_SHRINK_MAX,
@@ -142,6 +144,12 @@ struct cell {
 
 	// Number of LLCs with at least one CPU in this cell
 	u32 llc_present_cnt;
+
+	// LLC DSQs which currently have queued tasks but no CPUs in this cell
+	u64 llcs_to_drain;
+
+	// Rotation cursor for draining unserved LLC DSQs
+	u32 llc_drain_cnt;
 
 	// Per-LLC data (cacheline-aligned)
 	struct cell_llc llcs[MAX_LLCS];

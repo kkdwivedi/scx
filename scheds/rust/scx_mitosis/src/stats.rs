@@ -32,8 +32,8 @@ pub struct CellMetrics {
     pub borrowed_pct: f64,
     #[stat(desc = "Affinity violations % of global")]
     pub affn_violations_pct: f64,
-    #[stat(desc = "Steal %")]
-    pub steal_pct: f64,
+    #[stat(desc = "LLC drain %")]
+    pub llc_drain_pct: f64,
     #[stat(desc = "Pin reject skipped %")]
     pub pin_skip_pct: f64,
     #[stat(desc = "Slice shrink events")]
@@ -65,7 +65,7 @@ impl CellMetrics {
         self.cell_q_pct = ds.cell_q_pct;
         self.borrowed_pct = ds.borrowed_pct;
         self.affn_violations_pct = ds.affn_viol_pct;
-        self.steal_pct = ds.steal_pct;
+        self.llc_drain_pct = ds.llc_drain_pct;
         self.pin_skip_pct = ds.pin_skip_pct;
         self.share_of_decisions_pct = ds.share_of_decisions_pct;
         self.total_decisions = ds.total_decisions;
@@ -94,8 +94,8 @@ pub struct Metrics {
     pub borrowed_pct: f64,
     #[stat(desc = "Affinity violations % of global")]
     pub affn_violations_pct: f64,
-    #[stat(desc = "Steal %")]
-    pub steal_pct: f64,
+    #[stat(desc = "LLC drain %")]
+    pub llc_drain_pct: f64,
     #[stat(desc = "Pin reject skipped %")]
     pub pin_skip_pct: f64,
     #[stat(desc = "Slice shrink events")]
@@ -129,7 +129,7 @@ impl Metrics {
         self.cell_q_pct = ds.cell_q_pct;
         self.borrowed_pct = ds.borrowed_pct;
         self.affn_violations_pct = ds.affn_viol_pct;
-        self.steal_pct = ds.steal_pct;
+        self.llc_drain_pct = ds.llc_drain_pct;
         self.pin_skip_pct = ds.pin_skip_pct;
         self.share_of_decisions_pct = ds.share_of_decisions_pct;
         self.total_decisions = ds.total_decisions;

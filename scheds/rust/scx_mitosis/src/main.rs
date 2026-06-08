@@ -145,10 +145,6 @@ struct Opts {
     #[clap(long, action = clap::ArgAction::SetTrue)]
     enable_llc_awareness: bool,
 
-    /// Enable work stealing. This is only relevant when LLC-awareness is enabled.
-    #[clap(long, action = clap::ArgAction::SetTrue)]
-    enable_work_stealing: bool,
-
     /// Parent cgroup path whose direct children become cells.
     /// When specified, cells are created for each direct child cgroup of this parent,
     /// with CPUs divided equally among cells. Example: --cell-parent-cgroup /workloads
@@ -278,7 +274,7 @@ struct DistributionStats {
     cell_q_pct: f64,
     borrowed_pct: f64,
     affn_viol_pct: f64,
-    steal_pct: f64,
+    llc_drain_pct: f64,
     pin_skip_pct: f64,
 
     // for formatting
@@ -301,7 +297,7 @@ impl Display for DistributionStats {
         };
         write!(
             f,
-            "{:width$} {:5.1}% | Local:{:4.1}% From: CPU:{:4.1}% Cell:{:4.1}% Borrow:{:4.1}% | V:{:4.1}% S:{:4.1}% PS:{:4.1}%",
+            "{:width$} {:5.1}% | Local:{:4.1}% From: CPU:{:4.1}% Cell:{:4.1}% Borrow:{:4.1}% | V:{:4.1}% Drain:{:4.1}% PS:{:4.1}%",
             self.total_decisions,
             self.share_of_decisions_pct,
             self.local_q_pct,
@@ -309,7 +305,7 @@ impl Display for DistributionStats {
             self.cell_q_pct,
             self.borrowed_pct,
             self.affn_viol_pct,
-            self.steal_pct,
+            self.llc_drain_pct,
             self.pin_skip_pct,
             width = descisions_width,
         )
@@ -317,11 +313,7 @@ impl Display for DistributionStats {
 }
 
 impl<'a> Scheduler<'a> {
-    fn validate_args(opts: &Opts) -> Result<()> {
-        if opts.enable_work_stealing && !opts.enable_llc_awareness {
-            bail!("Work stealing requires LLC-aware mode (--enable-llc-awareness)");
-        }
-
+    fn validate_args(_opts: &Opts) -> Result<()> {
         Ok(())
     }
 
@@ -384,7 +376,6 @@ impl<'a> Scheduler<'a> {
         // Set nr_llc in rodata
         rodata.nr_llc = nr_llc as u32;
         rodata.enable_llc_awareness = opts.enable_llc_awareness;
-        rodata.enable_work_stealing = opts.enable_work_stealing;
 
         rodata.userspace_managed_cell_mode = opts.cell_parent_cgroup.is_some();
 
@@ -902,7 +893,7 @@ impl<'a> Scheduler<'a> {
         global_queue_decisions: u64,
         scope_queue_decisions: u64,
         scope_affn_viols: u64,
-        scope_steals: u64,
+        scope_llc_drains: u64,
         scope_pin_skips: u64,
     ) -> Result<DistributionStats> {
         // First % on the line: share of global work
@@ -928,10 +919,10 @@ impl<'a> Scheduler<'a> {
             100.0 * (scope_affn_viols as f64) / (scope_queue_decisions as f64)
         };
 
-        let steal_pct = if scope_queue_decisions == 0 {
+        let llc_drain_pct = if scope_queue_decisions == 0 {
             0.0
         } else {
-            100.0 * (scope_steals as f64) / (scope_queue_decisions as f64)
+            100.0 * (scope_llc_drains as f64) / (scope_queue_decisions as f64)
         };
 
         let pin_skip_pct = if scope_queue_decisions == 0 {
@@ -957,7 +948,7 @@ impl<'a> Scheduler<'a> {
             cell_q_pct: queue_pct[2],
             borrowed_pct: queue_pct[3],
             affn_viol_pct: affinity_violations_percent,
-            steal_pct,
+            llc_drain_pct,
             pin_skip_pct,
             global_queue_decisions,
         });
@@ -985,10 +976,10 @@ impl<'a> Scheduler<'a> {
             .map(|&cell| cell[bpf_intf::cell_stat_idx_CSTAT_AFFN_VIOL as usize])
             .sum::<u64>();
 
-        // Sum steals over all cells
-        let scope_steals: u64 = cell_stats_delta
+        // Sum LLC drains over all cells
+        let scope_llc_drains: u64 = cell_stats_delta
             .iter()
-            .map(|&cell| cell[bpf_intf::cell_stat_idx_CSTAT_STEAL as usize])
+            .map(|&cell| cell[bpf_intf::cell_stat_idx_CSTAT_LLC_DRAIN as usize])
             .sum::<u64>();
 
         // Sum pin skips over all cells
@@ -1004,7 +995,7 @@ impl<'a> Scheduler<'a> {
                 global_queue_decisions,
                 global_queue_decisions,
                 scope_affn_viols,
-                scope_steals,
+                scope_llc_drains,
                 scope_pin_skips,
             )
             .context("calculating global queue distribution stats")?;
@@ -1059,9 +1050,9 @@ impl<'a> Scheduler<'a> {
             let scope_affn_viols: u64 =
                 cell_stats_delta[cell][bpf_intf::cell_stat_idx_CSTAT_AFFN_VIOL as usize];
 
-            // Steals for this cell
-            let scope_steals: u64 =
-                cell_stats_delta[cell][bpf_intf::cell_stat_idx_CSTAT_STEAL as usize];
+            // LLC drains for this cell
+            let scope_llc_drains: u64 =
+                cell_stats_delta[cell][bpf_intf::cell_stat_idx_CSTAT_LLC_DRAIN as usize];
 
             // Pin skips for this cell
             let scope_pin_skips: u64 =
@@ -1073,7 +1064,7 @@ impl<'a> Scheduler<'a> {
                     global_queue_decisions,
                     cell_queue_decisions,
                     scope_affn_viols,
-                    scope_steals,
+                    scope_llc_drains,
                     scope_pin_skips,
                 )
                 .with_context(|| {
