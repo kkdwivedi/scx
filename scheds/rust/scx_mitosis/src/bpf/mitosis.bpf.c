@@ -720,6 +720,43 @@ static __always_inline s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, st
 	return pick_idle_cpu_from(p, task_cpumask, prev_cpu, idle_smtmask);
 }
 
+static __always_inline bool task_shared_dsq_has_backlog(struct task_ctx *tctx)
+{
+	s32 nr_queued;
+
+	if (!tctx->all_cell_cpus_allowed || dsq_is_invalid(tctx->dsq))
+		return false;
+
+	nr_queued = scx_bpf_dsq_nr_queued(tctx->dsq.raw);
+	return nr_queued > 0;
+}
+
+static __always_inline void kick_task_dsq_cpu(struct task_ctx *tctx, s32 preferred_cpu)
+{
+	const struct cpumask *cpumask;
+	s32 cpu;
+
+	if (!tctx->cpumask)
+		return;
+
+	cpumask = (const struct cpumask *)tctx->cpumask;
+
+	if (preferred_cpu >= 0 && preferred_cpu < nr_possible_cpus &&
+	    bpf_cpumask_test_cpu(preferred_cpu, cpumask)) {
+		scx_bpf_kick_cpu(preferred_cpu, SCX_KICK_IDLE);
+		return;
+	}
+
+	cpu = scx_bpf_pick_idle_cpu(cpumask, SCX_PICK_IDLE_CORE);
+	if (cpu < 0)
+		cpu = scx_bpf_pick_idle_cpu(cpumask, 0);
+	if (cpu < 0)
+		cpu = bpf_cpumask_any_distribute(cpumask);
+
+	if (cpu >= 0 && cpu < nr_possible_cpus)
+		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+}
+
 /*
  * Try to find an idle CPU for a task. First searches within the cell's
  * own CPUs, then tries borrowing from other cells if enabled.
@@ -734,6 +771,14 @@ static __always_inline s32 try_pick_idle_cpu(struct task_struct *p, s32 prev_cpu
 					     struct cpu_ctx *cctx, struct task_ctx *tctx, bool kick)
 {
 	s32 cpu;
+
+	/*
+	 * Direct local dispatch bypasses the shared subcell DSQ's vtime order.
+	 * Once shared work is queued, enqueue this task there too so dispatch
+	 * consumes the oldest runnable task first.
+	 */
+	if (task_shared_dsq_has_backlog(tctx))
+		return -EBUSY;
 
 	cpu = pick_idle_cpu(p, prev_cpu, cctx, tctx);
 	if (cpu >= 0) {
@@ -1055,6 +1100,9 @@ void BPF_STRUCT_OPS(mitosis_enqueue, struct task_struct *p, u64 enq_flags)
 	if (enable_llc_awareness && tctx->all_cell_cpus_allowed)
 		refresh_subcell_llc_drain_after_enqueue(tctx->cell, tctx->subcell, tctx->llc);
 
+	if (tctx->all_cell_cpus_allowed)
+		kick_task_dsq_cpu(tctx, cpu >= 0 ? cpu : task_cpu);
+
 	/* Shrink the running task's slice for this pinned waiter.
 	 * We know this task is pinned (!all_cell_cpus_allowed). */
 	if (!tctx->all_cell_cpus_allowed && enable_slice_shrinking) {
@@ -1065,7 +1113,7 @@ void BPF_STRUCT_OPS(mitosis_enqueue, struct task_struct *p, u64 enq_flags)
 	}
 
 	/* Kick the CPU if needed */
-	if (!__COMPAT_is_enq_cpu_selected(enq_flags) && cpu >= 0)
+	if (!tctx->all_cell_cpus_allowed && !__COMPAT_is_enq_cpu_selected(enq_flags) && cpu >= 0)
 		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 }
 
