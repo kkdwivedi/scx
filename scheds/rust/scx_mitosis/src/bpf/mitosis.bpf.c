@@ -1084,7 +1084,7 @@ void BPF_STRUCT_OPS(mitosis_enqueue, struct task_struct *p, u64 enq_flags)
 		if (cpu < 0)
 			return;
 
-	} else if (!__COMPAT_is_enq_cpu_selected(enq_flags)) {
+	} else if (!__COMPAT_is_enq_cpu_selected(enq_flags) && !(enq_flags & SCX_ENQ_LAST)) {
 		/*
 		 * If we haven't selected a cpu, then we haven't looked for and kicked an
 		 * idle CPU. Let's do the lookup now.
@@ -1217,10 +1217,7 @@ void BPF_STRUCT_OPS(mitosis_dispatch, s32 cpu, struct task_struct *prev)
 		found = true;
 	}
 
-	/*
-	 * Otherwise, scx will keep running prev if prev->scx.flags &
-	 * SCX_TASK_QUEUED (we don't set SCX_OPS_ENQ_LAST), and otherwise go idle.
-	 */
+	/* Otherwise, keep whatever the core selected locally, or go idle. */
 	if (!found) {
 		if (enable_llc_awareness && try_drain_subcell_llcs(cell, subcell, llc))
 			cstat_inc(CSTAT_LLC_DRAIN, cell, cctx);
@@ -3028,5 +3025,6 @@ SCX_OPS_DEFINE(mitosis,
 	       .dump_task		= (void *)mitosis_dump_task,
 	       .init			= (void *)mitosis_init,
 	       .exit			= (void *)mitosis_exit,
+	       .flags			= SCX_OPS_ENQ_LAST,
 	       .name			= "mitosis");
 // clang-format on
