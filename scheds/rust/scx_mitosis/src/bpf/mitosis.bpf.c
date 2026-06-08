@@ -1229,6 +1229,18 @@ void BPF_STRUCT_OPS(mitosis_dispatch, s32 cpu, struct task_struct *prev)
 
 	/* Otherwise, keep whatever the core selected locally, or go idle. */
 	if (!found) {
+		/*
+		 * dsq_peek() is only an ordering hint. On kernels where peeking is
+		 * iterator-backed, treating a peek miss as authoritative can leave
+		 * queued tasks stranded while the CPU goes idle. Follow layered's
+		 * model and always attempt the moves; if both DSQs are actually
+		 * empty, move_to_local() simply returns false.
+		 */
+		if (scx_bpf_dsq_move_to_local(cpu_dsq.raw, 0))
+			return;
+		if (scx_bpf_dsq_move_to_local(subcell_dsq.raw, 0))
+			return;
+
 		if (enable_llc_awareness && try_drain_subcell_llcs(cell, subcell, llc))
 			cstat_inc(CSTAT_LLC_DRAIN, cell, cctx);
 		return;
