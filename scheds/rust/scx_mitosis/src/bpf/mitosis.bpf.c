@@ -789,7 +789,8 @@ static __always_inline bool task_shared_dsq_has_backlog(struct task_ctx *tctx)
 	return nr_queued > 0;
 }
 
-static __always_inline void kick_task_dsq_cpu(struct task_ctx *tctx, s32 preferred_cpu)
+static __always_inline void kick_task_dsq_cpu(struct task_ctx *tctx, s32 preferred_cpu,
+					      u64 kick_flags)
 {
 	const struct cpumask *cpumask;
 	s32 cpu;
@@ -801,7 +802,7 @@ static __always_inline void kick_task_dsq_cpu(struct task_ctx *tctx, s32 preferr
 
 	if (preferred_cpu >= 0 && preferred_cpu < nr_possible_cpus &&
 	    bpf_cpumask_test_cpu(preferred_cpu, cpumask)) {
-		scx_bpf_kick_cpu(preferred_cpu, SCX_KICK_IDLE);
+		scx_bpf_kick_cpu(preferred_cpu, kick_flags);
 		return;
 	}
 
@@ -812,7 +813,7 @@ static __always_inline void kick_task_dsq_cpu(struct task_ctx *tctx, s32 preferr
 		cpu = bpf_cpumask_any_distribute(cpumask);
 
 	if (cpu >= 0 && cpu < nr_possible_cpus)
-		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+		scx_bpf_kick_cpu(cpu, kick_flags);
 }
 
 /*
@@ -1043,6 +1044,7 @@ void BPF_STRUCT_OPS(mitosis_enqueue, struct task_struct *p, u64 enq_flags)
 	struct task_ctx *tctx;
 	struct subcell *subcell;
 	s32 task_cpu = scx_bpf_task_cpu(p);
+	bool force_dsq_kick = enq_flags & SCX_ENQ_LAST;
 	u64 vtime;
 	s32 cpu = -1;
 	u64 basis_vtime;
@@ -1074,9 +1076,6 @@ void BPF_STRUCT_OPS(mitosis_enqueue, struct task_struct *p, u64 enq_flags)
 		if (dynamic_affinity_cpu_selection) {
 			cpu = enqueue_pinned_cpu(p, tctx);
 			vtime = p->scx.dsq_vtime; /* re-read: may have been reset */
-			/* Kick target CPU — select_cpu may have returned a different one */
-			if (cpu >= 0)
-				scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 		} else {
 			cpu = get_cpu_from_dsq(tctx->dsq);
 		}
@@ -1097,6 +1096,7 @@ void BPF_STRUCT_OPS(mitosis_enqueue, struct task_struct *p, u64 enq_flags)
 		if (cpu == -1)
 			return;
 		if (cpu == -EBUSY) {
+			force_dsq_kick = true;
 			/*
 			 * Verifier gets unhappy claiming two different pointer types for
 			 * the same instruction here. This fixes it
@@ -1158,8 +1158,18 @@ void BPF_STRUCT_OPS(mitosis_enqueue, struct task_struct *p, u64 enq_flags)
 	if (enable_llc_awareness && tctx->all_cell_cpus_allowed)
 		refresh_subcell_llc_drain_after_enqueue(tctx->cell, tctx->subcell, tctx->llc);
 
-	if (tctx->all_cell_cpus_allowed)
-		kick_task_dsq_cpu(tctx, cpu >= 0 ? cpu : task_cpu);
+	if (tctx->all_cell_cpus_allowed) {
+		u64 kick_flags = force_dsq_kick ? 0 : SCX_KICK_IDLE;
+
+		/*
+		 * SCX_ENQ_LAST and pick-idle misses require a guaranteed follow-up
+		 * scheduling event. SCX_KICK_IDLE can be skipped while the target
+		 * CPU is still leaving its current scheduling cycle.
+		 */
+		kick_task_dsq_cpu(tctx, cpu >= 0 ? cpu : task_cpu, kick_flags);
+	} else if (cpu >= 0) {
+		scx_bpf_kick_cpu(cpu, force_dsq_kick ? 0 : SCX_KICK_IDLE);
+	}
 
 	/* Shrink the running task's slice for this pinned waiter.
 	 * We know this task is pinned (!all_cell_cpus_allowed). */
@@ -3025,6 +3035,7 @@ SCX_OPS_DEFINE(mitosis,
 	       .dump_task		= (void *)mitosis_dump_task,
 	       .init			= (void *)mitosis_init,
 	       .exit			= (void *)mitosis_exit,
-	       .flags			= SCX_OPS_ENQ_LAST,
+	       .flags			= SCX_OPS_KEEP_BUILTIN_IDLE |
+					  SCX_OPS_ENQ_LAST,
 	       .name			= "mitosis");
 // clang-format on
