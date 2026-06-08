@@ -264,6 +264,64 @@ static __always_inline int create_subcell_dsqs(u32 cell_id, u32 subcell_id)
 	return 0;
 }
 
+static __always_inline int recalc_subcell_llc_counts_from_cpu_ctx(u32 cell_id, u32 subcell_id)
+{
+	struct cell *cell = lookup_cell(cell_id);
+	struct subcell *subcell;
+	u32 llc_cpu_cnt_tmp[MAX_LLCS] = { 0 };
+	u32 cpu, llc, total_cpus = 0;
+
+	if (!cell)
+		return -ENOENT;
+
+	subcell = lookup_subcell(cell_id, subcell_id);
+	if (!subcell)
+		return -ENOENT;
+
+	bpf_for(cpu, 0, nr_possible_cpus)
+	{
+		struct cpu_ctx *cctx = lookup_cpu_ctx(cpu);
+
+		if (!cctx)
+			return -ENOENT;
+		if (READ_ONCE(cctx->cell) != cell_id || READ_ONCE(cctx->subcell) != subcell_id)
+			continue;
+
+		llc = READ_ONCE(cctx->llc);
+		if (llc >= nr_llc || llc >= MAX_LLCS)
+			continue;
+		barrier_var(llc);
+
+		llc_cpu_cnt_tmp[llc]++;
+		total_cpus++;
+	}
+
+	scoped_guard(spin_lock, &cell->lock)
+	{
+		u32 llc_idx;
+
+		bpf_for(llc_idx, 0, nr_llc)
+		{
+			if (llc_idx >= MAX_LLCS)
+				break;
+			subcell->llcs[llc_idx].cpu_cnt = llc_cpu_cnt_tmp[llc_idx];
+		}
+
+		if (subcell_id == 0)
+			cell->cpu_cnt = total_cpus;
+		subcell->cpu_cnt = total_cpus;
+	}
+
+	bpf_for(llc, 0, nr_llc)
+	{
+		if (llc >= MAX_LLCS)
+			break;
+		refresh_subcell_llc_drain(subcell, cell_id, subcell_id, llc, llc_cpu_cnt_tmp[llc]);
+	}
+
+	return 0;
+}
+
 /*
  * Cells are allocated in the timer callback and freed in cgroup exit handlers.
  * allocate_cell and free_cell use atomic operations to handle concurrent access.
@@ -2084,6 +2142,16 @@ static void dump_cell_cpumask(int id)
 	dump_cpumask(cell_cpumask);
 }
 
+static void dump_subcell_cpumask(u32 cell_id, u32 subcell_id)
+{
+	const struct cpumask *subcell_cpumask;
+
+	if (!(subcell_cpumask = lookup_subcell_cpumask(cell_id, subcell_id)))
+		return;
+
+	dump_cpumask(subcell_cpumask);
+}
+
 void BPF_STRUCT_OPS(mitosis_dump, struct scx_dump_ctx *dctx)
 {
 	dsq_id_t dsq_id;
@@ -2095,7 +2163,7 @@ void BPF_STRUCT_OPS(mitosis_dump, struct scx_dump_ctx *dctx)
 
 	bpf_for(i, 0, MAX_CELLS)
 	{
-		struct subcell *subcell;
+		u32 subcell_id;
 
 		if (!(cell = lookup_cell(i)))
 			return;
@@ -2106,18 +2174,53 @@ void BPF_STRUCT_OPS(mitosis_dump, struct scx_dump_ctx *dctx)
 		scx_bpf_dump("CELL[%d] CPUS=", i);
 		dump_cell_cpumask(i);
 		scx_bpf_dump("\n");
-		subcell = lookup_subcell(i, 0);
-		if (!subcell)
-			return;
 
-		/* Per-LLC stats deferred: FAKE_FLAT_SUBCELL_LLC used for now */
-		dsq_id_t dsq_id = get_subcell_llc_dsq_id(i, 0, FAKE_FLAT_SUBCELL_LLC);
-		if (dsq_is_invalid(dsq_id))
-			return;
+		bpf_for(subcell_id, 0, MAX_SUBCELLS_PER_CELL)
+		{
+			struct subcell *subcell = lookup_subcell(i, subcell_id);
+			u32 llc;
 
-		scx_bpf_dump("SUBCELL[%d:%d] vtime=%llu nr_queued=%d\n", i, 0,
-			     READ_ONCE(subcell->llcs[FAKE_FLAT_SUBCELL_LLC].vtime_now),
-			     scx_bpf_dsq_nr_queued(dsq_id.raw));
+			if (!subcell)
+				return;
+			if (!subcell->in_use)
+				continue;
+
+			scx_bpf_dump("SUBCELL[%d:%d] cpus=", i, subcell_id);
+			dump_subcell_cpumask(i, subcell_id);
+			scx_bpf_dump(" cpu_cnt=%u drain=0x%llx\n", READ_ONCE(subcell->cpu_cnt),
+				     READ_ONCE(subcell->llcs_to_drain));
+
+			if (!enable_llc_awareness) {
+				dsq_id = get_subcell_llc_dsq_id(i, subcell_id,
+								FAKE_FLAT_SUBCELL_LLC);
+				if (dsq_is_invalid(dsq_id))
+					return;
+				scx_bpf_dump("  LLC[%d] vtime=%llu cpu_cnt=%u nr_queued=%d\n",
+					     FAKE_FLAT_SUBCELL_LLC,
+					     READ_ONCE(subcell->llcs[FAKE_FLAT_SUBCELL_LLC]
+							       .vtime_now),
+					     READ_ONCE(subcell->llcs[FAKE_FLAT_SUBCELL_LLC]
+							       .cpu_cnt),
+					     scx_bpf_dsq_nr_queued(dsq_id.raw));
+				continue;
+			}
+
+			bpf_for(llc, 0, nr_llc)
+			{
+				bool draining;
+
+				if (llc >= MAX_LLCS)
+					break;
+				dsq_id = get_subcell_llc_dsq_id(i, subcell_id, llc);
+				if (dsq_is_invalid(dsq_id))
+					return;
+				draining = READ_ONCE(subcell->llcs_to_drain) & (1LLU << llc);
+				scx_bpf_dump("  LLC[%u] vtime=%llu cpu_cnt=%u drain=%d nr_queued=%d\n",
+					     llc, READ_ONCE(subcell->llcs[llc].vtime_now),
+					     READ_ONCE(subcell->llcs[llc].cpu_cnt), draining,
+					     scx_bpf_dsq_nr_queued(dsq_id.raw));
+			}
+		}
 	}
 
 	bpf_for(i, 0, nr_possible_cpus)
@@ -2774,7 +2877,7 @@ int apply_cell_config(void *ctx)
 						return -EINVAL;
 					if (!subcell->in_use)
 						continue;
-					if (recalc_subcell_llc_counts(c, subcell_id, NULL))
+					if (recalc_subcell_llc_counts_from_cpu_ctx(c, subcell_id))
 						return -EINVAL;
 				}
 			}
