@@ -149,10 +149,8 @@ static inline s32 pick_llc_for_task(u32 cell_id)
 		total_cpu_cnt = cell->cpu_cnt;
 	}
 
-	if (!total_cpu_cnt) {
-		scx_bpf_error("pick_llc_for_task: cell %d has no CPUs accounted yet", cell_id);
+	if (!total_cpu_cnt)
 		return LLC_INVALID;
-	}
 
 	/* Find the LLC domain corresponding to the target value using
 	 * weighted selection - accumulate CPU counts until we exceed target */
@@ -172,10 +170,8 @@ static inline s32 pick_llc_for_task(u32 cell_id)
 		}
 	}
 
-	if (ret == LLC_INVALID) {
-		scx_bpf_error("pick_llc_for_task: invalid LLC");
+	if (ret == LLC_INVALID)
 		return LLC_INVALID;
-	}
 
 	return ret;
 }
@@ -193,8 +189,63 @@ static void zero_cell_vtimes(struct cell *cell)
 	}
 }
 
+enum llc_assignment_result {
+	LLC_ASSIGN_OK = 0,
+	LLC_ASSIGN_EMPTY = 1,
+};
+
+static __always_inline s32 assign_task_to_llc(struct task_struct *p, struct task_ctx *tctx,
+					      s32 new_llc)
+{
+	if (!tctx) {
+		scx_bpf_error("Invalid task context");
+		return -ENOENT;
+	}
+
+	if (new_llc < 0)
+		return -EINVAL;
+
+	u32 llc = (u32)new_llc;
+	if (!llc_is_valid(llc) || llc >= nr_llc)
+		return -EINVAL;
+
+	struct bpf_cpumask *cpumask = tctx->cpumask;
+	if (!cpumask) {
+		scx_bpf_error("tctx->cpumask is NULL");
+		return -EINVAL;
+	}
+
+	const struct cpumask *cell_cpumask = lookup_cell_cpumask(tctx->cell);
+	if (!cell_cpumask)
+		return -ENOENT;
+
+	const struct cpumask *llc_mask = lookup_llc_cpumask(llc);
+	if (!llc_mask)
+		return -ENOENT;
+
+	bpf_cpumask_and(cpumask, cell_cpumask, p->cpus_ptr);
+	bpf_cpumask_and(cpumask, (const struct cpumask *)cpumask, llc_mask);
+
+	if (bpf_cpumask_empty((const struct cpumask *)cpumask)) {
+		bpf_cpumask_and(cpumask, cell_cpumask, p->cpus_ptr);
+		return LLC_ASSIGN_EMPTY;
+	}
+
+	tctx->llc = new_llc;
+	tctx->dsq = get_cell_llc_dsq_id(tctx->cell, llc);
+	if (dsq_is_invalid(tctx->dsq))
+		return -EINVAL;
+
+	struct cell *cell = lookup_cell(tctx->cell);
+	if (!cell)
+		return -ENOENT;
+
+	p->scx.dsq_vtime = READ_ONCE(cell->llcs[llc].vtime_now);
+	return LLC_ASSIGN_OK;
+}
+
 /*
- * Detect and handle cross-LLC task migration.
+ * Detect and handle same-cell cross-LLC task migration.
  * Called from running() to check if task's assigned LLC differs
  * from the CPU's LLC (indicating work stealing occurred).
  *
@@ -203,22 +254,28 @@ static void zero_cell_vtimes(struct cell *cell)
 static inline int maybe_retag_stolen_task(struct task_struct *p, struct task_ctx *tctx,
 					  struct cpu_ctx *cctx)
 {
+	s32 ret;
+
 	/* No mismatch = no steal, fast path */
 	if (tctx->llc == cctx->llc)
 		return 0;
 
+	if (!tctx->all_cell_cpus_allowed)
+		return 0;
+
+	if (tctx->cell != cctx->cell)
+		return 0;
+
+	ret = assign_task_to_llc(p, tctx, cctx->llc);
+	if (ret == LLC_ASSIGN_EMPTY)
+		return 0;
+	if (ret < 0)
+		return ret;
+
 	/* Task was stolen to a different LLC - update accounting */
 	tctx->steal_count++;
 	tctx->last_stolen_at = scx_bpf_now();
-
-	/* Assign task to new LLC */
-	tctx->llc = cctx->llc;
-
-	/*
-	 * New LLC, need new cpumask. This updates the task vtime
-	 * to that of the new cell-LLC DSQ.
-	 */
-	return update_task_cpumask(p, tctx);
+	return 0;
 }
 
 enum steal_work_result {
@@ -297,42 +354,35 @@ static inline int update_task_llc_assignment(struct task_struct *p, struct task_
 		return -ENOENT;
 	}
 
-	const struct cpumask *llc_mask = NULL;
-
 	// Let's get a new LLC for this task
 	s32 new_llc = pick_llc_for_task(tctx->cell);
-	if (new_llc < 0)
-		return -EINVAL;
-
-	tctx->llc = new_llc;
-	llc_mask = lookup_llc_cpumask((u32)tctx->llc);
-	if (!llc_mask)
-		return -ENOENT;
-
-	/* --- Narrow the effective cpumask by the chosen LLC --- */
-	/* tctx->cpumask already contains (task_affinity & cell_mask) */
-	struct bpf_cpumask *cpumask = tctx->cpumask;
-	if (!cpumask) {
-		scx_bpf_error("tctx->cpumask is NULL");
-		return -EINVAL;
-	}
-	bpf_cpumask_and(cpumask, (const struct cpumask *)cpumask, llc_mask);
-
-	/* If empty after intersection, nothing can run here */
-	if (bpf_cpumask_empty((const struct cpumask *)cpumask)) {
-		scx_bpf_error("Empty cpumask after intersection");
-		return -EINVAL;
+	if (new_llc >= 0) {
+		s32 ret = assign_task_to_llc(p, tctx, new_llc);
+		if (ret == LLC_ASSIGN_OK)
+			return 0;
+		if (ret < 0)
+			return ret;
 	}
 
-	/* --- Point to the correct (cell,LLC) DSQ and set vtime baseline --- */
-	tctx->dsq = get_cell_llc_dsq_id(tctx->cell, tctx->llc);
-	if (dsq_is_invalid(tctx->dsq))
-		return -EINVAL;
+	/*
+	 * LLC counts can temporarily lag the published cell cpumask during
+	 * reconfiguration. Fall back to the current cpumask so a stale count
+	 * does not terminate the scheduler or strand the task.
+	 */
+	u32 llc;
+	bpf_for(llc, 0, nr_llc)
+	{
+		s32 ret;
 
-	struct cell *cell = lookup_cell(tctx->cell);
-	if (!cell)
-		return -ENOENT;
+		if (new_llc >= 0 && llc == (u32)new_llc)
+			continue;
 
-	p->scx.dsq_vtime = READ_ONCE(cell->llcs[new_llc].vtime_now);
-	return 0;
+		ret = assign_task_to_llc(p, tctx, (s32)llc);
+		if (ret == LLC_ASSIGN_OK)
+			return 0;
+		if (ret < 0)
+			return ret;
+	}
+
+	return -EINVAL;
 }
