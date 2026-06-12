@@ -89,7 +89,6 @@ struct cpu_ctx {
 	u64 vtime_now;
 	u32 cell;
 	u32 llc;
-	u32 llc_drain_seq;
 };
 
 struct cgrp_ctx {
@@ -137,9 +136,6 @@ struct cell {
 	u64 owner_cgid;
 	// Whether or not the cell is used
 	u32 in_use;
-
-	// LLC DSQs that need draining because this cell has no CPUs there
-	u64 llcs_to_drain;
 
 	// Per-LLC data (cacheline-aligned)
 	struct cell_llc llcs[MAX_LLCS];

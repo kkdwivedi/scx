@@ -919,10 +919,6 @@ void BPF_STRUCT_OPS(mitosis_enqueue, struct task_struct *p, u64 enq_flags)
 		vtime = basis_vtime - slice_ns;
 
 	scx_bpf_dsq_insert_vtime(p, tctx->dsq.raw, slice_ns, vtime, enq_flags);
-	if (enable_llc_awareness && tctx->all_cell_cpus_allowed) {
-		if (mark_cell_llc_drain_on_enqueue(tctx->cell, tctx->llc))
-			return;
-	}
 
 	/* Shrink the running task's slice for this pinned waiter.
 	 * We know this task is pinned (!all_cell_cpus_allowed). */
@@ -961,16 +957,6 @@ void BPF_STRUCT_OPS(mitosis_dispatch, s32 cpu, struct task_struct *prev)
 
 	if (dsq_is_invalid(cell_dsq) || dsq_is_invalid(cpu_dsq)) {
 		return;
-	}
-
-	if (enable_llc_awareness) {
-		s32 ret = try_drain_cell_llcs(cell, llc, cctx);
-		if (ret < 0)
-			return;
-		if (ret == STEAL_WORK_DRAINED) {
-			cstat_inc(CSTAT_DRAIN_CNT, cell, cctx);
-			return;
-		}
 	}
 
 	/* Peek at cell-LLC DSQ head */
@@ -1329,10 +1315,6 @@ static int update_timer_cb(void *map, int *key, struct bpf_timer *timer)
 			scx_bpf_error("failed to publish cpumask for cell %d", cell_idx);
 			return 0;
 		}
-		if (enable_llc_awareness) {
-			if (refresh_cell_llc_drain_state(cell_idx))
-				return 0;
-		}
 
 		barrier();
 		WRITE_ONCE(cgrp_ctx->cell, cell_idx);
@@ -1365,10 +1347,6 @@ static int update_timer_cb(void *map, int *key, struct bpf_timer *timer)
 	if (publish_prepared_cpumask(&root_cell_cpumaskw->primary, &root_bpf_cpumask)) {
 		scx_bpf_error("failed to publish root cpumask");
 		return 0;
-	}
-	if (enable_llc_awareness) {
-		if (refresh_cell_llc_drain_state(ROOT_CELL_ID))
-			return 0;
 	}
 
 	barrier();
@@ -2311,13 +2289,6 @@ int apply_cell_config(void *ctx)
 		if (publish_prepared_cpumask(&cpumaskw->primary, &new_cpumask)) {
 			scx_bpf_error("failed to publish cpumask for cell_id %d", cell_id);
 			return -EINVAL;
-		}
-		if (enable_llc_awareness) {
-			scoped_guard(rcu)
-			{
-				if (refresh_cell_llc_drain_state(cell_id))
-					return -EINVAL;
-			}
 		}
 
 		/* Apply borrowable cpumask for this cell */
