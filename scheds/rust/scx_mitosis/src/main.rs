@@ -17,11 +17,12 @@ use config::{ConfiguredCells, SubcellMatch};
 
 use std::cmp::max;
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::fmt;
 use std::fmt::Display;
 use std::mem::MaybeUninit;
 use std::os::fd::AsFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
@@ -61,6 +62,8 @@ use stats::CellMetrics;
 use stats::Metrics;
 
 const SCHEDULER_NAME: &str = "scx_mitosis";
+const DEFAULT_CELL_CONFIG_PATH: &str = "/root/config.json";
+const DEFAULT_CELL_CONFIG_JSON: &str = include_str!("../config.json");
 const MAX_CELLS: usize = bpf_intf::consts_MAX_CELLS as usize;
 const MAX_SUBCELLS_PER_CELL: usize = bpf_intf::consts_MAX_SUBCELLS_PER_CELL as usize;
 const MAX_LLCS: usize = bpf_intf::consts_MAX_LLCS as usize;
@@ -540,15 +543,11 @@ impl<'a> Scheduler<'a> {
             None
         };
         let configured_cells = if let Some(ref cell_config) = opts.cell_config {
-            Some(
-                ConfiguredCells::load(cell_config, MAX_CELLS as u32, topology.span.clone())
-                    .with_context(|| {
-                        format!(
-                            "initializing configured cells from {}",
-                            cell_config.display()
-                        )
-                    })?,
-            )
+            Some(load_configured_cells(
+                cell_config,
+                MAX_CELLS as u32,
+                topology.span.clone(),
+            )?)
         } else {
             None
         };
@@ -2358,8 +2357,82 @@ where
     Ok(running_ns_by_subcell)
 }
 
-#[clap_main::clap_main]
-fn main(opts: Opts) -> Result<()> {
+fn load_configured_cells(
+    cell_config: &Path,
+    max_cells: u32,
+    all_cpus: Cpumask,
+) -> Result<ConfiguredCells> {
+    if cell_config == Path::new(DEFAULT_CELL_CONFIG_PATH) && !cell_config.exists() {
+        info!(
+            "Using embedded default cell config for {}",
+            DEFAULT_CELL_CONFIG_PATH
+        );
+        ConfiguredCells::load_from_str(
+            DEFAULT_CELL_CONFIG_JSON,
+            DEFAULT_CELL_CONFIG_PATH,
+            max_cells,
+            all_cpus,
+        )
+        .with_context(|| {
+            format!(
+                "initializing configured cells from embedded {}",
+                DEFAULT_CELL_CONFIG_PATH
+            )
+        })
+    } else {
+        ConfiguredCells::load(cell_config, max_cells, all_cpus).with_context(|| {
+            format!(
+                "initializing configured cells from {}",
+                cell_config.display()
+            )
+        })
+    }
+}
+
+fn default_launch_args(program: OsString) -> Vec<OsString> {
+    vec![
+        program,
+        "--cell-config".into(),
+        DEFAULT_CELL_CONFIG_PATH.into(),
+        "--exit-dump-len".into(),
+        "1048576".into(),
+        "--cpu-controller-disabled".into(),
+        "--dynamic-affinity-cpu-selection".into(),
+        "--enable-borrowing".into(),
+        "--enable-rebalancing".into(),
+        "--enable-slice-shrinking".into(),
+        "--enable-llc-awareness".into(),
+        "--cell0-min-cpus".into(),
+        "1".into(),
+    ]
+}
+
+fn parse_opts() -> Opts {
+    let args: Vec<OsString> = std::env::args_os().collect();
+    let parse_args = if args.len() <= 1 {
+        default_launch_args(
+            args.first()
+                .cloned()
+                .unwrap_or_else(|| OsString::from(SCHEDULER_NAME)),
+        )
+    } else {
+        args
+    };
+
+    match Opts::try_parse_from(parse_args) {
+        Ok(opts) => opts,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(-1);
+        }
+    }
+}
+
+fn main() -> Result<()> {
+    run(parse_opts())
+}
+
+fn run(opts: Opts) -> Result<()> {
     if opts.version {
         println!(
             "scx_mitosis {}",
@@ -2449,8 +2522,13 @@ fn main(opts: Opts) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_subcell_assignments, CpuAssignment, Cpumask, Opts};
+    use super::{
+        default_launch_args, validate_subcell_assignments, CpuAssignment, Cpumask, Opts,
+        DEFAULT_CELL_CONFIG_PATH,
+    };
     use clap::Parser;
+    use std::ffi::OsString;
+    use std::path::Path;
 
     fn cpumask(cpus: &[usize]) -> Cpumask {
         let mut mask = Cpumask::new();
@@ -2471,6 +2549,25 @@ mod tests {
     #[test]
     fn requires_cell_parent_cgroup_for_scheduler_mode() {
         assert!(Opts::try_parse_from(["scx_mitosis"]).is_err());
+    }
+
+    #[test]
+    fn default_launch_args_enable_test_configuration() {
+        let opts =
+            Opts::try_parse_from(default_launch_args(OsString::from("scx_mitosis"))).unwrap();
+
+        assert_eq!(
+            opts.cell_config.as_deref(),
+            Some(Path::new(DEFAULT_CELL_CONFIG_PATH))
+        );
+        assert_eq!(opts.exit_dump_len, 1_048_576);
+        assert!(opts.cpu_controller_disabled);
+        assert!(opts.dynamic_affinity_cpu_selection);
+        assert!(opts.enable_borrowing);
+        assert!(opts.enable_rebalancing);
+        assert!(opts.enable_slice_shrinking);
+        assert!(opts.enable_llc_awareness);
+        assert_eq!(opts.cell0_min_cpus, 1);
     }
 
     #[test]

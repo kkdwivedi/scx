@@ -111,6 +111,21 @@ impl ConfiguredCells {
         Self::load_with_root(path, PathBuf::from("/sys/fs/cgroup"), max_cells, all_cpus)
     }
 
+    pub fn load_from_str(
+        contents: &str,
+        source: &str,
+        max_cells: u32,
+        all_cpus: Cpumask,
+    ) -> Result<Self> {
+        Self::load_from_str_with_root(
+            contents,
+            source,
+            PathBuf::from("/sys/fs/cgroup"),
+            max_cells,
+            all_cpus,
+        )
+    }
+
     fn load_with_root(
         path: &Path,
         cgroup_root: PathBuf,
@@ -119,8 +134,24 @@ impl ConfiguredCells {
     ) -> Result<Self> {
         let contents = fs::read_to_string(path)
             .with_context(|| format!("reading cell config {}", path.display()))?;
+        Self::load_from_str_with_root(
+            &contents,
+            &path.display().to_string(),
+            cgroup_root,
+            max_cells,
+            all_cpus,
+        )
+    }
+
+    fn load_from_str_with_root(
+        contents: &str,
+        source: &str,
+        cgroup_root: PathBuf,
+        max_cells: u32,
+        all_cpus: Cpumask,
+    ) -> Result<Self> {
         let specs: Vec<CellSpec> = serde_json::from_str(&contents)
-            .with_context(|| format!("parsing cell config {}", path.display()))?;
+            .with_context(|| format!("parsing cell config {}", source))?;
         let specs = compile_specs(specs)?;
         let root_spec_idx = specs.iter().rposition(|spec| spec.matcher.is_none());
         if specs
