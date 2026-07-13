@@ -273,10 +273,11 @@ struct Cell {
     subcells: Vec<Subcell>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct Subcell {
     id: u32,
     name: String,
+    weight: f64,
     primary: Cpumask,
     borrowable: Option<Cpumask>,
     matches: Vec<Vec<SubcellMatch>>,
@@ -296,6 +297,7 @@ impl Subcell {
         Self {
             id,
             name: default_subcell_name(id),
+            weight: 1.0,
             primary: Cpumask::new(),
             borrowable: None,
             matches: Vec::new(),
@@ -865,8 +867,6 @@ impl<'a> Scheduler<'a> {
             (cell_manager.get_cell_assignments(), cpu_assignments)
         };
 
-        // TODO(kkd): Plug in demand weighted subcell assignments once
-        // supported.
         let subcell_assignments = self.compute_subcell_assignments(&cpu_assignments)?;
 
         self.apply_cell_config(&cell_assignments, &cpu_assignments, &subcell_assignments)
@@ -904,6 +904,7 @@ impl<'a> Scheduler<'a> {
                 .map(|subcell| Subcell {
                     id: subcell.id,
                     name: subcell.name.clone(),
+                    weight: subcell.weight,
                     primary: Cpumask::new(),
                     borrowable: None,
                     matches: subcell.matches.clone(),
@@ -1012,9 +1013,6 @@ impl<'a> Scheduler<'a> {
                     .map_or(true, |cell| cell.cpus != a.primary)
             });
 
-            // TODO(kkd): Need logic to check changed demand assignments for
-            // subcells as well once demand weighted allocations work.
-
             if !changed {
                 return Ok(());
             }
@@ -1066,7 +1064,7 @@ impl<'a> Scheduler<'a> {
                         cell.subcells
                             .iter()
                             .map(|subcell| {
-                                let weight = if use_demand
+                                let demand = if use_demand
                                     && (subcell.id as usize) < MAX_SUBCELLS_PER_CELL
                                 {
                                     self.smoothed_subcell_util[cell_assignment.id as usize]
@@ -1074,6 +1072,7 @@ impl<'a> Scheduler<'a> {
                                 } else {
                                     1.0
                                 };
+                                let weight = demand * subcell.weight;
                                 CpuRecipient::unpinned(subcell.id, weight, &cell_assignment.primary)
                             })
                             .collect()
@@ -1114,6 +1113,16 @@ impl<'a> Scheduler<'a> {
                         .collect()
                 })
                 .unwrap_or_default();
+            let existing_weights: HashMap<u32, f64> = self
+                .cells
+                .get(cell_id)
+                .map(|cell| {
+                    cell.subcells
+                        .iter()
+                        .map(|subcell| (subcell.id, subcell.weight))
+                        .collect()
+                })
+                .unwrap_or_default();
             let subcells: Vec<Subcell> = bpf_cell
                 .subcells
                 .iter()
@@ -1125,6 +1134,7 @@ impl<'a> Scheduler<'a> {
                             .get(&subcell.id)
                             .cloned()
                             .unwrap_or_else(|| default_subcell_name(subcell.id)),
+                        weight: existing_weights.get(&subcell.id).copied().unwrap_or(1.0),
                         primary: read_cpumask_from_bytes(&subcell.primary.mask)?,
                         borrowable: Some(read_cpumask_from_bytes(&subcell.borrowable.mask)?),
                         matches: existing_matches

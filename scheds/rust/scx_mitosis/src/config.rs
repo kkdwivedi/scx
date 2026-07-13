@@ -24,6 +24,7 @@ use crate::cell_manager::CpuRecipient;
 pub struct ConfiguredSubcell {
     pub id: u32,
     pub name: String,
+    pub weight: f64,
     pub matches: Vec<Vec<SubcellMatch>>,
 }
 
@@ -63,6 +64,8 @@ struct CellSpec {
 #[derive(Clone, Debug, Deserialize)]
 struct SubcellSpec {
     name: String,
+    #[serde(default = "default_subcell_weight")]
+    weight: f64,
     #[serde(default = "default_subcell_matches")]
     matches: Vec<Vec<SubcellMatch>>,
 }
@@ -420,6 +423,14 @@ fn normalize_subcells(subcells: Vec<SubcellSpec>) -> Result<Vec<ConfiguredSubcel
     let mut catch_all = None;
 
     for subcell in subcells {
+        if !subcell.weight.is_finite() || subcell.weight < 0.0 {
+            bail!(
+                "subcell '{}' weight must be a finite non-negative number, got {}",
+                subcell.name,
+                subcell.weight
+            );
+        }
+
         if is_catch_all_subcell(&subcell) {
             if catch_all.is_some() {
                 bail!("cell config contains multiple catch-all subcells");
@@ -427,6 +438,7 @@ fn normalize_subcells(subcells: Vec<SubcellSpec>) -> Result<Vec<ConfiguredSubcel
             catch_all = Some(ConfiguredSubcell {
                 id: 0,
                 name: subcell.name,
+                weight: subcell.weight,
                 matches: subcell.matches,
             });
             continue;
@@ -435,6 +447,7 @@ fn normalize_subcells(subcells: Vec<SubcellSpec>) -> Result<Vec<ConfiguredSubcel
         normalized.push(ConfiguredSubcell {
             id: next_id,
             name: subcell.name,
+            weight: subcell.weight,
             matches: subcell.matches,
         });
         next_id += 1;
@@ -466,8 +479,13 @@ fn default_catch_all_subcell() -> ConfiguredSubcell {
     ConfiguredSubcell {
         id: 0,
         name: "rest".to_string(),
+        weight: default_subcell_weight(),
         matches: vec![Vec::new()],
     }
+}
+
+fn default_subcell_weight() -> f64 {
+    1.0
 }
 
 fn default_subcell_matches() -> Vec<Vec<SubcellMatch>> {
@@ -587,9 +605,9 @@ mod tests {
                 "name": "allotment",
                 "matches": { "CgroupRegex": "workload-tw-[^/]+\\.allotment\\.slice" },
                 "subcells": [
-                  { "name": "hhvmworker", "matches": [[{ "CommPrefix": "hhvmworker" }]] },
+                  { "name": "hhvmworker", "weight": 85.0, "matches": [[{ "CommPrefix": "hhvmworker" }]] },
                   { "name": "mcrpxy-web", "matches": [[{ "CommPrefix": "mcrpxy-web" }]] },
-                  { "name": "rest", "matches": [[]] }
+                  { "name": "rest", "weight": 15.0, "matches": [[]] }
                 ]
               },
               { "name": "workload.slice", "matches": { "CgroupContains": "workload.slice" } },
@@ -609,10 +627,38 @@ mod tests {
         let subcells = &configured.specs[0].subcells;
         assert_eq!(subcells[0].id, 0);
         assert_eq!(subcells[0].name, "rest");
+        assert_eq!(subcells[0].weight, 15.0);
         assert_eq!(subcells[1].id, 1);
         assert_eq!(subcells[1].name, "hhvmworker");
+        assert_eq!(subcells[1].weight, 85.0);
         assert_eq!(subcells[2].id, 2);
         assert_eq!(subcells[2].name, "mcrpxy-web");
+        assert_eq!(subcells[2].weight, 1.0);
+    }
+
+    #[test]
+    fn rejects_invalid_subcell_weight() {
+        let config = write_config(
+            r#"
+            [
+              {
+                "name": "allotment",
+                "matches": { "CgroupContains": "allotment" },
+                "subcells": [
+                  { "name": "bad", "weight": -1.0, "matches": [[]] }
+                ]
+              }
+            ]
+            "#,
+        );
+        let result = ConfiguredCells::load_with_root(
+            config.path(),
+            PathBuf::from("/tmp"),
+            256,
+            Cpumask::new(),
+        );
+
+        assert!(result.is_err());
     }
 
     #[test]
