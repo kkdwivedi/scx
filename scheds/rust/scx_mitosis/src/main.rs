@@ -1085,6 +1085,7 @@ impl<'a> Scheduler<'a> {
                     &cell_assignment.primary,
                     &recipients,
                     SHARE_SIBLING_SUBCELL_CPUS,
+                    &self.cpu_to_llc,
                 )
             })
             .collect()
