@@ -16,16 +16,6 @@
         ]
       },
       {
-        "name": "mcrpxy-web",
-        "matches": [
-          [
-            {
-              "CommPrefix": "mcrpxy-web"
-            }
-          ]
-        ]
-      },
-      {
         "name": "rest",
         "matches": [
           []
